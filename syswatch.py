@@ -1803,7 +1803,6 @@ class FullRenderer:
         # Time-axis timestamps, shared across every chart in this window.
         oldest_ts = filtered[0]["ts"]
         newest_ts = filtered[-1]["ts"]
-        mid_ts    = filtered[len(filtered) // 2]["ts"]
 
         def _fmt_axis(dt_obj):
             # 1h / 8h / 24h windows use clock time; 7d / 30d use calendar date.
@@ -1842,14 +1841,23 @@ class FullRenderer:
         ]
 
         for label, key, thresh_key in metrics:
-            values = [r[key] for r in filtered if r.get(key) is not None]
-            if not values:
+            pairs = [(r["ts"], r[key]) for r in filtered if r.get(key) is not None]
+            if not pairs:
                 continue
+            timestamps = [p[0] for p in pairs]
+            values     = [p[1] for p in pairs]
 
             # Downsample to fit terminal width
             if len(values) > max_points:
-                step   = max(1, len(values) // max_points)
-                values = values[::step][-max_points:]
+                step       = max(1, len(values) // max_points)
+                values     = values[::step][-max_points:]
+                timestamps = timestamps[::step][-max_points:]
+
+            # Stretch sparse data so the chart fills the available width
+            if len(values) < max_points:
+                step       = max_points // len(values)
+                values     = [v for v in values for _ in range(step)][:max_points]
+                timestamps = [t for t in timestamps for _ in range(step)][:max_points]
 
             latest     = values[-1]
             chart_attr = threshold_cp(latest, thresh_key)
@@ -1871,9 +1879,9 @@ class FullRenderer:
                 self._add(row, 0, cline, chart_attr)
                 row += 1
 
-            # Time-axis row: align labels to the true data content, not the
-            # terminal width. The y-axis prefix is everything up to and
-            # including the ┤/┼ tick plus one trailing space.
+            # Time-axis row: a dynamic number of evenly spaced ticks that adapts
+            # to the available data width. The y-axis prefix is everything up to
+            # and including the ┤/┼ tick plus one trailing space.
             first    = chart_lines[0] if chart_lines else ""
             axis_pos = -1
             for i, cchar in enumerate(first):
@@ -1885,15 +1893,44 @@ class FullRenderer:
                 longest  = max(len(cl) for cl in chart_lines)
                 data_w   = longest - prefix_w
                 if row < cy + ch and data_w > 0:
-                    right_lbl = _fmt_axis(newest_ts)
-                    if data_w >= 20:
-                        self._add(row, prefix_w, _fmt_axis(oldest_ts), cp(CP_MUTED))
-                    self._add(row, max(0, prefix_w + data_w - len(right_lbl)),
-                              right_lbl, cp(CP_MUTED))
-                    if data_w > 40:
-                        mid_lbl = _fmt_axis(mid_ts)
-                        self._add(row, prefix_w + (data_w - len(mid_lbl)) // 2,
-                                  mid_lbl, cp(CP_MUTED))
+                    old_t   = timestamps[0].timestamp()
+                    new_t   = timestamps[-1].timestamp()
+                    label_w = 5 if history_window <= 2 else 6
+                    # How many labels fit without crowding: at least 8 columns of
+                    # breathing room between adjacent tick centres, capped at 10.
+                    # Falls back to 2 (oldest + newest) on narrow terminals.
+                    max_ticks = min(10, max(2, data_w // (label_w + 8)))
+                    ticks     = []
+                    for i in range(max_ticks):
+                        frac = i / (max_ticks - 1)
+                        col  = int(round(frac * (data_w - 1))) - label_w // 2
+                        col  = max(0, min(data_w - label_w, col))
+                        tdt  = _dt.fromtimestamp(old_t + (new_t - old_t) * frac)
+                        ticks.append((col, _fmt_axis(tdt)))
+                    # Resolve overlaps right-to-left, dropping the earlier label.
+                    kept          = []
+                    occupied_left = data_w
+                    for col, text in reversed(ticks):
+                        if col + len(text) <= occupied_left:
+                            kept.append((col, text))
+                            occupied_left = col
+                    # Tick-mark row: a │ centred under each retained label. Drawn
+                    # only when the label row below it still fits, so it can never
+                    # push the time labels off the panel.
+                    if row + 1 < cy + ch:
+                        tick_chars = [" "] * data_w
+                        for col, text in kept:
+                            centre = col + label_w // 2
+                            if 0 <= centre < data_w:
+                                tick_chars[centre] = "│"
+                        self._add(row, prefix_w, "".join(tick_chars), cp(CP_MUTED))
+                        row += 1
+                    axis_chars = [" "] * data_w
+                    for col, text in kept:
+                        for j, tchar in enumerate(text):
+                            if 0 <= col + j < data_w:
+                                axis_chars[col + j] = tchar
+                    self._add(row, prefix_w, "".join(axis_chars), cp(CP_MUTED))
                 row += 1
 
             row += 1  # spacer between charts
