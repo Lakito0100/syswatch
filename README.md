@@ -59,6 +59,7 @@ Reports the health of `/dev/mmcblk0` (SD card or eMMC). Tries `smartctl` first, 
 
 ### 6 · BACKUP
 > Requires the [project-backup](https://github.com/Lakito0100/backup-system) tool.
+
 Reads `/var/log/project-backup-status.json` written by the `project-backup` tool. Displays the status, timestamp, duration, and file counts of the last backup run; lists configured source paths with existence checks; and shows a scrollable run history with a files-transferred sparkline.
 
 ### 7 · HISTORY
