@@ -69,7 +69,7 @@ Reads the metrics CSV recorded by syswatch-logger and renders line charts for CP
 
 ## syswatch-logger
 
-syswatch-logger is a lightweight background process that wakes up every 5 minutes, samples CPU %, RAM %, CPU temperature, and root-disk usage, and appends one CSV line to `~/.local/share/syswatch/metrics.csv`. Lines older than 30 days are trimmed automatically after each write.
+syswatch-logger is a lightweight background process that wakes up every 2 minutes, samples CPU %, RAM %, CPU temperature, and root-disk usage, and appends one CSV line to `~/.local/share/syswatch/metrics.csv`. Lines older than 30 days are trimmed automatically after each write.
 
 `install-syswatch.sh` installs and starts syswatch-logger as a systemd service (`syswatch-logger.service`) running as the installed user. The service starts automatically on boot and restarts on failure.
 
