@@ -1776,8 +1776,8 @@ class FullRenderer:
         cy = 2
         ch = H - 3
 
-        window_labels = ["24 HOURS", "7 DAYS", "30 DAYS"]
-        window_secs   = [86400, 604800, 2592000]
+        window_labels = ["1 HOUR", "8 HOURS", "24 HOURS", "7 DAYS", "30 DAYS"]
+        window_secs   = [3600, 28800, 86400, 604800, 2592000]
         wlabel        = window_labels[history_window]
 
         self._label(cy, 0, f"HISTORY — {wlabel}  [h] next window")
@@ -1791,12 +1791,46 @@ class FullRenderer:
             self._add(mid + 1, max(0, (W - len(msg2)) // 2), msg2, cp(CP_MUTED))
             return
 
-        cutoff  = _dt.now().timestamp() - window_secs[history_window]
+        now_ts   = _dt.now().timestamp()
+        win_secs = window_secs[history_window]
+        cutoff   = now_ts - win_secs
         filtered = [r for r in rows if r["ts"].timestamp() >= cutoff]
         if not filtered:
             msg = f"No data in the last {wlabel.lower()}."
             self._add(cy + ch // 2, max(0, (W - len(msg)) // 2), msg, cp(CP_MUTED))
             return
+
+        # Time-axis timestamps, shared across every chart in this window.
+        oldest_ts = filtered[0]["ts"]
+        newest_ts = filtered[-1]["ts"]
+        mid_ts    = filtered[len(filtered) // 2]["ts"]
+
+        def _fmt_axis(dt_obj):
+            # 1h / 8h / 24h windows use clock time; 7d / 30d use calendar date.
+            if history_window <= 2:
+                return dt_obj.strftime("%H:%M")
+            return dt_obj.strftime("%b %d")
+
+        row = cy + 1
+
+        # Data-coverage indicator: shown only while the window is not yet full.
+        # Jitter tolerance is one sample interval (120s) plus a 25% margin.
+        window_start = now_ts - win_secs
+        if oldest_ts.timestamp() - window_start > 150:
+            span_secs = newest_ts.timestamp() - oldest_ts.timestamp()
+            if span_secs < 7200:
+                span_str = f"{int(round(span_secs / 60))}m"
+            elif span_secs < 172800:
+                span_str = f"{span_secs / 3600:.1f}h"
+            else:
+                span_str = f"{span_secs / 86400:.1f}d"
+            short_labels = ["1h", "8h", "24h", "7d", "30d"]
+            cov_line = (f"DATA: {oldest_ts.strftime('%H:%M')} → "
+                        f"{newest_ts.strftime('%H:%M')}  "
+                        f"({span_str} of {short_labels[history_window]} window)")
+            if row < cy + ch:
+                self._add(row, 0, cov_line, cp(CP_MUTED))
+            row += 1
 
         chart_h    = 5
         max_points = max(2, W - 12)
@@ -1807,7 +1841,6 @@ class FullRenderer:
             ("DISK %",   "disk_pct", "ram_pct"),
         ]
 
-        row = cy + 1
         for label, key, thresh_key in metrics:
             values = [r[key] for r in filtered if r.get(key) is not None]
             if not values:
@@ -1836,6 +1869,31 @@ class FullRenderer:
                 if row >= cy + ch:
                     break
                 self._add(row, 0, cline, chart_attr)
+                row += 1
+
+            # Time-axis row: align labels to the true data content, not the
+            # terminal width. The y-axis prefix is everything up to and
+            # including the ┤/┼ tick plus one trailing space.
+            first    = chart_lines[0] if chart_lines else ""
+            axis_pos = -1
+            for i, cchar in enumerate(first):
+                if cchar in ("┤", "┼"):
+                    axis_pos = i
+                    break
+            if axis_pos >= 0:
+                prefix_w = axis_pos + 2
+                longest  = max(len(cl) for cl in chart_lines)
+                data_w   = longest - prefix_w
+                if row < cy + ch and data_w > 0:
+                    right_lbl = _fmt_axis(newest_ts)
+                    if data_w >= 20:
+                        self._add(row, prefix_w, _fmt_axis(oldest_ts), cp(CP_MUTED))
+                    self._add(row, max(0, prefix_w + data_w - len(right_lbl)),
+                              right_lbl, cp(CP_MUTED))
+                    if data_w > 40:
+                        mid_lbl = _fmt_axis(mid_ts)
+                        self._add(row, prefix_w + (data_w - len(mid_lbl)) // 2,
+                                  mid_lbl, cp(CP_MUTED))
                 row += 1
 
             row += 1  # spacer between charts
@@ -1912,7 +1970,7 @@ def _curses_main(stdscr, args):
             elif ord("1") <= ch <= ord("7"):
                 active_tab = ch - ord("0")
             elif ch == ord("h") and active_tab == 7:
-                history_window = (history_window + 1) % 3
+                history_window = (history_window + 1) % 5
             elif ch == ord("/") and active_tab == 3:
                 mode       = "filter_input"
                 filter_buf = log_filter

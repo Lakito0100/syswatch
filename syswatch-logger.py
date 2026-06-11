@@ -67,8 +67,8 @@ def main():
         description="syswatch-logger — background metrics sampler for syswatch",
     )
     parser.add_argument(
-        "--interval", type=int, default=300, metavar="N",
-        help="sample interval in seconds (default 300)",
+        "--interval", type=int, default=120, metavar="N",
+        help="sample interval in seconds (default 120)",
     )
     parser.add_argument(
         "--version", action="version", version="syswatch-logger 1.0.0",
