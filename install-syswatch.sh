@@ -84,10 +84,16 @@ EOF
     SERVICE_DST="/etc/systemd/system/syswatch-logger.service"
     if [[ -f "$SERVICE_SRC" ]]; then
         install -m 644 "$SERVICE_SRC" "$SERVICE_DST"
-        echo "  Installed $SERVICE_DST"
+        # The repo service file ships with a default User=; rewrite it on the
+        # installed copy so the logger runs as the human installing it (the user
+        # behind sudo), falling back to 'lukas' if SUDO_USER is unset.
+        INSTALL_USER="${SUDO_USER:-lukas}"
+        sed -i "s/^User=.*/User=${INSTALL_USER}/" "$SERVICE_DST"
+        echo "  Installed $SERVICE_DST (User=${INSTALL_USER})"
         systemctl daemon-reload
         systemctl enable syswatch-logger.service
-        systemctl start syswatch-logger.service
+        # restart (not start) so an updated syswatch-logger.py takes effect on reinstall
+        systemctl restart syswatch-logger.service
         if systemctl is-active --quiet syswatch-logger.service; then
             echo "  syswatch-logger service is running."
         else

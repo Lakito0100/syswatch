@@ -39,7 +39,8 @@ import asciichartpy
 WATCHED_SERVICES = [
     "ssh", "networking", "cron", "bluetooth", "avahi-daemon", "triggerhappy",
 ]
-SCAN_SUBNET = "192.168"   # first two octets; sweeps .0.1–.1.254
+SCAN_SUBNET = "192.168"   # fallback only: first two octets swept (.0.1–.1.254)
+                          # when the Pi's own /24 cannot be auto-detected
 
 # ── tunables ───────────────────────────────────────────────────────────────────
 HISTORY        = 60
@@ -475,20 +476,35 @@ class ARPPassiveThread(threading.Thread):
             try:
                 now    = time.time()
                 parsed = self._parse_arp_table()
+                # Phase 1: under the lock, find which MACs are new. We hold the
+                # lock only briefly here so readers (e.g. the render loop) never
+                # stall on the slow DNS lookups that follow.
+                with _state_lock:
+                    devices  = _state["devices"]
+                    new_macs = [mac for mac in parsed if mac not in devices]
+                # Phase 2: resolve hostnames for the new IPs *outside* the lock —
+                # a getnameinfo() call can block for seconds.
+                hostnames = {mac: _resolve_hostname(parsed[mac]["ip"])
+                             for mac in new_macs}
+                # Phase 3: re-acquire the lock to insert the new devices and
+                # refresh existing ones.
                 with _state_lock:
                     devices = _state["devices"]
                     for mac, info in parsed.items():
                         if mac not in devices:
+                            # Still new after the gap — insert it.
                             is_intruder = (now - PROCESS_START) > 30
                             status      = "INTRUDER" if is_intruder else "Active"
-                            hostname    = _resolve_hostname(info["ip"])
                             devices[mac] = DeviceInfo(
-                                ip=info["ip"], mac=mac, hostname=hostname,
+                                ip=info["ip"], mac=mac,
+                                hostname=hostnames.get(mac, info["ip"]),
                                 first_seen=now, last_seen=now, status=status,
                             )
                             if is_intruder:
                                 push_alert(f"INTRUDER: {mac} at {info['ip']}")
                         else:
+                            # Either pre-existing, or it raced in between the two
+                            # lock acquisitions — just update it.
                             dev           = devices[mac]
                             dev.ip        = info["ip"]
                             dev.last_seen = now
@@ -507,8 +523,32 @@ class PingSweepThread(threading.Thread):
         super().__init__(daemon=True)
         self._stop    = threading.Event()
         self._enabled = enabled
+        self._prefix  = None  # first three octets of the /24 to sweep
+
+    @staticmethod
+    def _detect_prefix():
+        # Derive the local /24 from the Pi's own primary IPv4 address. The UDP
+        # socket sends nothing; connecting just makes the kernel choose the
+        # outbound interface so getsockname() reveals our address.
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                s.connect(("8.8.8.8", 80))
+                ip = s.getsockname()[0]
+            finally:
+                s.close()
+            octets = ip.split(".")
+            if len(octets) == 4:
+                return ".".join(octets[:3])
+        except Exception:
+            pass
+        return None
 
     def _all_ips(self):
+        # Sweep the auto-detected /24 (e.g. 192.168.178.1–254). If detection
+        # failed, fall back to the SCAN_SUBNET constant's two /24s.
+        if self._prefix:
+            return [f"{self._prefix}.{d}" for d in range(1, 255)]
         parts = SCAN_SUBNET.split(".")
         a, b  = parts[0], parts[1]
         ips   = []
@@ -543,6 +583,7 @@ class PingSweepThread(threading.Thread):
         return alive
 
     def run(self):
+        self._prefix = self._detect_prefix()
         while not self._stop.is_set():
             if not self._enabled:
                 self._stop.wait(PING_CYCLE)
@@ -609,6 +650,18 @@ class LogThread(threading.Thread):
         except Exception:
             return None
 
+    def _reap(self):
+        # Terminate and reap the journalctl child so it doesn't linger as a
+        # zombie when its stream ends or errors out. Always clears self._proc.
+        if self._proc is not None:
+            try:
+                if self._proc.poll() is None:
+                    self._proc.terminate()
+                self._proc.wait(timeout=1)
+            except Exception:
+                pass
+        self._proc = None
+
     def run(self):
         self._launch()
         while not self._stop.is_set():
@@ -619,10 +672,10 @@ class LogThread(threading.Thread):
             try:
                 line = self._proc.stdout.readline()
             except Exception:
-                self._proc = None
+                self._reap()
                 continue
             if line == b"":
-                self._proc = None
+                self._reap()
                 self._stop.wait(5.0)
                 continue
             entry = self._parse_line(line)
@@ -1739,6 +1792,24 @@ class FullRenderer:
     _HIST_CSV = os.path.expanduser("~/.local/share/syswatch/metrics.csv")
     _HIST_TTL = 10.0
 
+    def _hist_csv_path(self):
+        # Normal case: the per-user metrics file under the caller's home.
+        if os.path.exists(self._HIST_CSV):
+            return self._HIST_CSV
+        # When syswatch is launched with sudo, ~ expands to /root and the
+        # logger's data (written as the real user) would be missed. Fall back
+        # to the invoking user's home if that file exists.
+        try:
+            if os.geteuid() == 0:
+                sudo_user = os.environ.get("SUDO_USER")
+                if sudo_user:
+                    alt = f"/home/{sudo_user}/.local/share/syswatch/metrics.csv"
+                    if os.path.exists(alt):
+                        return alt
+        except Exception:
+            pass
+        return self._HIST_CSV
+
     def _load_history(self):
         now = time.monotonic()
         if (self._hist_cache is not None
@@ -1746,7 +1817,7 @@ class FullRenderer:
             return self._hist_cache[1]
         rows = []
         try:
-            with open(self._HIST_CSV) as f:
+            with open(self._hist_csv_path()) as f:
                 for line in f:
                     line = line.strip()
                     if not line:
@@ -1804,6 +1875,20 @@ class FullRenderer:
         oldest_ts = filtered[0]["ts"]
         newest_ts = filtered[-1]["ts"]
 
+        # Estimate the logger's sample interval from the data (median of the
+        # deltas between consecutive samples) so gap detection and the coverage
+        # check adapt to a non-default --interval. Needs ≥3 rows to be
+        # meaningful; otherwise assume the 120s default.
+        if len(filtered) >= 3:
+            deltas = sorted(
+                filtered[i]["ts"].timestamp() - filtered[i - 1]["ts"].timestamp()
+                for i in range(1, len(filtered)))
+            n = len(deltas)
+            sample_interval = (deltas[n // 2] if n % 2
+                               else (deltas[n // 2 - 1] + deltas[n // 2]) / 2)
+        else:
+            sample_interval = 120.0
+
         def _fmt_axis(dt_obj):
             # 1h / 8h / 24h windows use clock time; 7d / 30d use calendar date.
             if history_window <= 2:
@@ -1813,9 +1898,9 @@ class FullRenderer:
         row = cy + 1
 
         # Data-coverage indicator: shown only while the window is not yet full.
-        # Jitter tolerance is one sample interval (120s) plus a 25% margin.
+        # Jitter tolerance is one estimated sample interval plus a 25% margin.
         window_start = now_ts - win_secs
-        if oldest_ts.timestamp() - window_start > 150:
+        if oldest_ts.timestamp() - window_start > sample_interval * 1.25:
             span_secs = newest_ts.timestamp() - oldest_ts.timestamp()
             if span_secs < 7200:
                 span_str = f"{int(round(span_secs / 60))}m"
@@ -1824,8 +1909,10 @@ class FullRenderer:
             else:
                 span_str = f"{span_secs / 86400:.1f}d"
             short_labels = ["1h", "8h", "24h", "7d", "30d"]
-            cov_line = (f"DATA: {oldest_ts.strftime('%H:%M')} → "
-                        f"{newest_ts.strftime('%H:%M')}  "
+            # Multi-day windows (7d / 30d) need the date too, not just the time.
+            cov_fmt  = "%b %d %H:%M" if history_window >= 3 else "%H:%M"
+            cov_line = (f"DATA: {oldest_ts.strftime(cov_fmt)} → "
+                        f"{newest_ts.strftime(cov_fmt)}  "
                         f"({span_str} of {short_labels[history_window]} window)")
             if row < cy + ch:
                 self._add(row, 0, cov_line, cp(CP_MUTED))
@@ -1847,19 +1934,59 @@ class FullRenderer:
             timestamps = [p[0] for p in pairs]
             values     = [p[1] for p in pairs]
 
-            # Downsample to fit terminal width
-            if len(values) > max_points:
-                step       = max(1, len(values) // max_points)
-                values     = values[::step][-max_points:]
-                timestamps = timestamps[::step][-max_points:]
+            # True data span, captured before any resampling reshapes the lists
+            # so the time axis always reflects the real oldest/newest samples
+            # regardless of how the trim/stretch below cuts the tail.
+            true_oldest = timestamps[0]
+            true_newest = timestamps[-1]
 
-            # Stretch sparse data so the chart fills the available width
-            if len(values) < max_points:
+            # Downsample to fit terminal width *before* inserting gap markers,
+            # so the trim can never skip over an inserted None and hide a real
+            # outage. down_step records the trim factor; the kept points end up
+            # down_step× farther apart than the raw sample interval.
+            down_step = 1
+            if len(values) > max_points:
+                down_step  = max(1, len(values) // max_points)
+                values     = values[::down_step][-max_points:]
+                timestamps = timestamps[::down_step][-max_points:]
+
+            # Gap markers for logger outages: any jump larger than 5× the
+            # estimated sample interval means the logger was not running. One
+            # None (with a synthetic midpoint timestamp) is inserted at each
+            # such gap so asciichartpy leaves that stretch of the chart blank.
+            # After downsampling the kept points are down_step× farther apart,
+            # so scale the threshold to match. Capped at 20 gaps so a
+            # frequently-restarted logger can't shred the chart into slivers.
+            GAP_THRESHOLD = 5 * sample_interval * down_step
+            MAX_GAPS      = 20
+            gap_values     = [values[0]]
+            gap_timestamps = [timestamps[0]]
+            gaps_inserted  = 0
+            for i in range(1, len(values)):
+                prev_ts, cur_ts = timestamps[i - 1], timestamps[i]
+                if (gaps_inserted < MAX_GAPS
+                        and cur_ts.timestamp() - prev_ts.timestamp() > GAP_THRESHOLD):
+                    mid = _dt.fromtimestamp(
+                        (prev_ts.timestamp() + cur_ts.timestamp()) / 2)
+                    gap_values.append(None)
+                    gap_timestamps.append(mid)
+                    gaps_inserted += 1
+                gap_values.append(values[i])
+                gap_timestamps.append(cur_ts)
+            values, timestamps = gap_values, gap_timestamps
+
+            # Stretch sparse data so the chart fills the available width. Only
+            # real (non-None) samples count toward this decision; each entry —
+            # None gap markers included — is repeated by the same step so the
+            # gaps stay positionally aligned with the surrounding data.
+            non_none = sum(1 for v in values if v is not None)
+            if non_none < max_points:
                 step       = max_points // len(values)
                 values     = [v for v in values for _ in range(step)][:max_points]
                 timestamps = [t for t in timestamps for _ in range(step)][:max_points]
 
-            latest     = values[-1]
+            latest     = next((v for v in reversed(values) if v is not None),
+                              values[-1])
             chart_attr = threshold_cp(latest, thresh_key)
 
             if row >= cy + ch:
@@ -1893,8 +2020,8 @@ class FullRenderer:
                 longest  = max(len(cl) for cl in chart_lines)
                 data_w   = longest - prefix_w
                 if row < cy + ch and data_w > 0:
-                    old_t   = timestamps[0].timestamp()
-                    new_t   = timestamps[-1].timestamp()
+                    old_t   = true_oldest.timestamp()
+                    new_t   = true_newest.timestamp()
                     label_w = 5 if history_window <= 2 else 6
                     # How many labels fit without crowding: at least 8 columns of
                     # breathing room between adjacent tick centres, capped at 10.
@@ -2004,25 +2131,33 @@ def _curses_main(stdscr, args):
                 break
             elif ch == curses.KEY_RESIZE:
                 curses.update_lines_cols()
+                last_render = 0.0
             elif ord("1") <= ch <= ord("7"):
                 active_tab = ch - ord("0")
+                last_render = 0.0
             elif ch == ord("h") and active_tab == 7:
                 history_window = (history_window + 1) % 5
+                last_render = 0.0
             elif ch == ord("/") and active_tab == 3:
                 mode       = "filter_input"
                 filter_buf = log_filter
                 curses.curs_set(1)
+                last_render = 0.0
         elif mode == "filter_input":
             if ch == 27:
                 mode, filter_buf = "normal", ""
                 curses.curs_set(0)
+                last_render = 0.0
             elif ch in (curses.KEY_ENTER, 10, 13):
                 log_filter, mode, filter_buf = filter_buf, "normal", ""
                 curses.curs_set(0)
+                last_render = 0.0
             elif ch in (curses.KEY_BACKSPACE, 127):
                 filter_buf = filter_buf[:-1]
+                last_render = 0.0
             elif 32 <= ch <= 126:
                 filter_buf += chr(ch)
+                last_render = 0.0
 
         now = time.monotonic()
         if now - last_render >= REFRESH:

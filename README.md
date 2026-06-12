@@ -46,7 +46,7 @@ Press `q`, `Q`, or `Esc` to quit. Press `1`–`7` to switch tabs directly.
 Real-time CPU usage for each core plus an average bar with sparkline history. RAM and swap usage with bars. CPU and GPU temperature with a visual bar scaled to 90 °C, plus current clock frequency and core voltage. Throttle indicator showing under-voltage, frequency cap, throttle, and soft-temp-limit flags (● = active now, ○ = never). Network RX/TX rates and disk read/write rates with per-channel sparklines. Top 5 processes by CPU with PID, name, CPU%, memory%, and status.
 
 ### 2 · NETWORK
-Scans the local network using passive ARP table reading and an active ping sweep across `192.168.0.x`–`192.168.1.x`. Lists every discovered device with IP address, MAC address, resolved hostname, time since last seen, and status (Active / Recent / Idle). Devices that appear more than 30 seconds after startup are flagged as **INTRUDER** and trigger a footer alert.
+Scans the local network using passive ARP table reading and an active ping sweep across the Pi's own /24, auto-detected from its primary IPv4 address (falling back to the `SCAN_SUBNET` constant — `192.168.0.x`–`192.168.1.x` — if detection fails). Lists every discovered device with IP address, MAC address, resolved hostname, time since last seen, and status (Active / Recent / Idle). Devices that appear more than 30 seconds after startup are flagged as **INTRUDER** and trigger a footer alert.
 
 ### 3 · LOGS
 Streams the systemd journal in real time via `journalctl -f`. Shows service name, timestamp, and message for each entry. An error-rate sparkline and count in the header show errors per 60-second window. Press `/` to open the filter prompt (see below).
@@ -63,25 +63,27 @@ Reports the health of `/dev/mmcblk0` (SD card or eMMC). Tries `smartctl` first, 
 Reads `/var/log/project-backup-status.json` written by the `project-backup` tool. Displays the status, timestamp, duration, and file counts of the last backup run; lists configured source paths with existence checks; and shows a scrollable run history with a files-transferred sparkline.
 
 ### 7 · HISTORY
-Reads the metrics CSV recorded by syswatch-logger and renders line charts for CPU %, RAM %, CPU temperature, and disk % over the selected time window. Press `h` while on this tab to cycle between the last 1 hour, 8 hours, 24 hours, 7 days, and 30 days. Each chart is coloured using the same warning/critical thresholds as the live display. If no data is available yet, a message prompts you to start syswatch-logger.
+Reads the metrics CSV recorded by syswatch-logger and renders line charts for CPU %, RAM %, CPU temperature, and disk % over the selected time window. Press `h` while on this tab to cycle between the last 1 hour, 8 hours, 24 hours, 7 days, and 30 days. Each chart is coloured using the same warning/critical thresholds as the live display. If no data is available yet, a message prompts you to start syswatch-logger. When syswatch is launched with `sudo` (so `~` resolves to `/root`), it falls back to reading the invoking user's CSV at `/home/$SUDO_USER/.local/share/syswatch/metrics.csv`.
 
 ---
 
 ## syswatch-logger
 
-syswatch-logger is a lightweight background process that wakes up every 2 minutes, samples CPU %, RAM %, CPU temperature, and root-disk usage, and appends one CSV line to `~/.local/share/syswatch/metrics.csv`. Lines older than 30 days are trimmed automatically after each write.
+syswatch-logger is a lightweight background process that wakes up every 2 minutes (120 seconds, the default `--interval`), samples CPU %, RAM %, CPU temperature, and root-disk usage, and appends one CSV line to `~/.local/share/syswatch/metrics.csv`. Lines older than 30 days are trimmed automatically after each write.
 
 `install-syswatch.sh` installs and starts syswatch-logger as a systemd service (`syswatch-logger.service`) running as the installed user. The service starts automatically on boot and restarts on failure.
 
 **CSV location:** `~/.local/share/syswatch/metrics.csv`
 
-Example rows:
+Example rows (2-minute spacing):
 ```
 2026-06-11T14:35:00,32.1,45.2,56.3,12.4
-2026-06-11T14:40:00,34.0,46.1,57.0,12.4
+2026-06-11T14:37:00,34.0,46.1,57.0,12.4
 ```
 
 To run the logger directly (e.g. for testing): `python3 syswatch-logger.py [--interval N] [--version]`
+
+To change the sample interval permanently, add `--interval N` (seconds) to the `ExecStart=` line in `/etc/systemd/system/syswatch-logger.service`, then run `sudo systemctl daemon-reload && sudo systemctl restart syswatch-logger`. The HISTORY tab estimates the interval from the data, so its gap detection adapts automatically.
 
 ---
 

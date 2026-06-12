@@ -14,7 +14,13 @@ def _bootstrap():
     missing = [p for p in ("psutil",) if ilu.find_spec(p) is None]
     if missing:
         print(f"Installing: {', '.join(missing)} …")
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet"] + missing)
+        try:
+            subprocess.check_call(
+                [sys.executable, "-m", "pip", "install", "--quiet"] + missing)
+        except subprocess.CalledProcessError:
+            subprocess.check_call(
+                [sys.executable, "-m", "pip", "install", "--quiet",
+                 "--break-system-packages"] + missing)
 
 _bootstrap()
 import psutil
