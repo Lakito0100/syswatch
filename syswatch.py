@@ -1940,53 +1940,48 @@ class FullRenderer:
             true_oldest = timestamps[0]
             true_newest = timestamps[-1]
 
-            # Downsample to fit terminal width *before* inserting gap markers,
-            # so the trim can never skip over an inserted None and hide a real
-            # outage. down_step records the trim factor; the kept points end up
-            # down_step× farther apart than the raw sample interval.
+            # Downsample to fit terminal width *before* detecting gaps, so the
+            # trim can't change which jumps look like outages. down_step records
+            # the trim factor; the kept points end up down_step× farther apart
+            # than the raw sample interval.
             down_step = 1
             if len(values) > max_points:
                 down_step  = max(1, len(values) // max_points)
                 values     = values[::down_step][-max_points:]
                 timestamps = timestamps[::down_step][-max_points:]
 
-            # Gap markers for logger outages: any jump larger than 5× the
-            # estimated sample interval means the logger was not running. One
-            # None (with a synthetic midpoint timestamp) is inserted at each
-            # such gap so asciichartpy leaves that stretch of the chart blank.
-            # After downsampling the kept points are down_step× farther apart,
-            # so scale the threshold to match. Capped at 20 gaps so a
+            # Gap detection for logger outages: any jump larger than 5× the
+            # estimated sample interval means the logger was not running. We
+            # record each gap's fractional position within the data (0.0–1.0)
+            # rather than injecting None — asciichartpy raises on None — and
+            # overlay a dotted vertical marker after the chart is drawn. After
+            # downsampling the kept points are down_step× farther apart, so
+            # scale the threshold to match. Capped at 20 gaps so a
             # frequently-restarted logger can't shred the chart into slivers.
             GAP_THRESHOLD = 5 * sample_interval * down_step
             MAX_GAPS      = 20
-            gap_values     = [values[0]]
-            gap_timestamps = [timestamps[0]]
-            gaps_inserted  = 0
+            gap_cols      = []
             for i in range(1, len(values)):
+                if len(gap_cols) >= MAX_GAPS:
+                    break
                 prev_ts, cur_ts = timestamps[i - 1], timestamps[i]
-                if (gaps_inserted < MAX_GAPS
-                        and cur_ts.timestamp() - prev_ts.timestamp() > GAP_THRESHOLD):
-                    mid = _dt.fromtimestamp(
-                        (prev_ts.timestamp() + cur_ts.timestamp()) / 2)
-                    gap_values.append(None)
-                    gap_timestamps.append(mid)
-                    gaps_inserted += 1
-                gap_values.append(values[i])
-                gap_timestamps.append(cur_ts)
-            values, timestamps = gap_values, gap_timestamps
+                if cur_ts.timestamp() - prev_ts.timestamp() > GAP_THRESHOLD:
+                    # Fraction of the (post-downsample) width at this gap.
+                    gap_cols.append(i / (len(values) - 1))
 
-            # Stretch sparse data so the chart fills the available width. Only
-            # real (non-None) samples count toward this decision; each entry —
-            # None gap markers included — is repeated by the same step so the
-            # gaps stay positionally aligned with the surrounding data.
-            non_none = sum(1 for v in values if v is not None)
-            if non_none < max_points:
+            # Stretch sparse data so the chart fills the available width. The
+            # data is all real numbers, and because each entry is repeated
+            # uniformly, the gap fractions recorded above stay valid (they are
+            # fractions of the width, not absolute indices).
+            if len(values) < max_points:
                 step       = max_points // len(values)
                 values     = [v for v in values for _ in range(step)][:max_points]
                 timestamps = [t for t in timestamps for _ in range(step)][:max_points]
 
-            latest     = next((v for v in reversed(values) if v is not None),
-                              values[-1])
+            if len(values) < 2:
+                continue
+
+            latest     = values[-1]
             chart_attr = threshold_cp(latest, thresh_key)
 
             if row >= cy + ch:
@@ -2000,11 +1995,13 @@ class FullRenderer:
             except Exception:
                 chart_lines = ["  (chart error)"]
 
+            body_y0 = row
             for cline in chart_lines:
                 if row >= cy + ch:
                     break
                 self._add(row, 0, cline, chart_attr)
                 row += 1
+            body_y1 = row  # exclusive end of the drawn chart-body rows
 
             # Time-axis row: a dynamic number of evenly spaced ticks that adapts
             # to the available data width. The y-axis prefix is everything up to
@@ -2019,6 +2016,17 @@ class FullRenderer:
                 prefix_w = axis_pos + 2
                 longest  = max(len(cl) for cl in chart_lines)
                 data_w   = longest - prefix_w
+                # Overlay outage markers: a dotted vertical line down the chart
+                # body at each recorded gap fraction. Every write is bounds-
+                # checked so it can never draw outside the panel.
+                if data_w > 0:
+                    for frac in gap_cols:
+                        gap_col = int(round(frac * (data_w - 1)))
+                        gx      = prefix_w + gap_col
+                        if 0 <= gap_col < data_w and 0 <= gx < W:
+                            for gy in range(body_y0, body_y1):
+                                if cy <= gy < cy + ch:
+                                    self._add(gy, gx, "┊", cp(CP_WARN))
                 if row < cy + ch and data_w > 0:
                     old_t   = true_oldest.timestamp()
                     new_t   = true_newest.timestamp()
