@@ -45,6 +45,20 @@ def _cpu_temp():
     return None
 
 
+def _core_voltage():
+    try:
+        r = subprocess.run(
+            ["vcgencmd", "measure_volts", "core"],
+            capture_output=True, text=True, timeout=0.5,
+        )
+        raw = r.stdout.strip()
+        if raw.startswith("volt="):
+            return float(raw[5:].rstrip("V"))
+    except Exception:
+        pass
+    return None
+
+
 def _trim(csv_path, days=30):
     try:
         cutoff = time.time() - days * 86400
@@ -77,7 +91,7 @@ def main():
         help="sample interval in seconds (default 120)",
     )
     parser.add_argument(
-        "--version", action="version", version="syswatch-logger 1.0.0",
+        "--version", action="version", version="syswatch-logger 1.1.0",
     )
     args = parser.parse_args()
 
@@ -94,9 +108,13 @@ def main():
             mem  = psutil.virtual_memory().percent
             temp = _cpu_temp()
             disk = psutil.disk_usage("/").percent
+            volt = _core_voltage()
             ts   = _dt.now().strftime("%Y-%m-%dT%H:%M:%S")
             temp_str = f"{temp:.1f}" if temp is not None else ""
-            line = f"{ts},{cpu:.1f},{mem:.1f},{temp_str},{disk:.1f}\n"
+            # 4 decimals: core voltage moves in ~0.0125V steps, .1f would
+            # collapse the whole series to one flat value.
+            volt_str = f"{volt:.4f}" if volt is not None else ""
+            line = f"{ts},{cpu:.1f},{mem:.1f},{temp_str},{disk:.1f},{volt_str}\n"
             with open(csv_path, "a") as f:
                 f.write(line)
             _trim(csv_path)

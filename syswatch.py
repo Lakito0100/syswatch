@@ -60,6 +60,7 @@ THRESH = {
     "cpu_pct":  (80, 95),
     "ram_pct":  (75, 90),
     "cpu_temp": (70, 80),
+    "disk_pct": (85, 95),
 }
 
 TABS = ["1:SYSTEM", "2:NETWORK", "3:LOGS", "4:SERVICES", "5:SD CARD", "6:BACKUP", "7:HISTORY"]
@@ -778,6 +779,40 @@ class SDCardThread(threading.Thread):
     def __init__(self):
         super().__init__(daemon=True)
         self._stop = threading.Event()
+        # 0=ok, 1=warning, 2=critical — per mount, mirrors _temp_alert_level
+        self._disk_alert_level = {"fs_root": 0, "fs_boot": 0}
+
+    def _write_disk_alert(self, msg):
+        try:
+            log_dir = os.path.expanduser("~/.local/share/syswatch")
+            os.makedirs(log_dir, exist_ok=True)
+            log_path = os.path.join(log_dir, "disk_alerts.log")
+            ts = _dt.now().strftime("%Y-%m-%d %H:%M:%S")
+            with open(log_path, "a") as f:
+                f.write(f"{ts} {msg}\n")
+        except Exception:
+            pass
+
+    def _check_disk_alert(self, mount_key, mount_label, fs):
+        # Must never raise: run()'s bare try/except would otherwise drop the
+        # whole _state["sdcard"] update for the cycle.
+        if fs is None:
+            return
+        try:
+            pct = fs["pct"]
+            warn, crit = THRESH["disk_pct"]
+            level = 2 if pct >= crit else 1 if pct >= warn else 0
+            if level > self._disk_alert_level[mount_key]:
+                label     = "CRITICAL" if level == 2 else "WARNING"
+                threshold = crit if level == 2 else warn
+                sys.stdout.write("\a")
+                sys.stdout.flush()
+                self._write_disk_alert(
+                    f"{label} disk={mount_label} {pct:.1f}% (threshold={threshold}%)"
+                )
+            self._disk_alert_level[mount_key] = level
+        except Exception:
+            pass
 
     @staticmethod
     def _soc_temp():
@@ -927,6 +962,8 @@ class SDCardThread(threading.Thread):
                 # SD cards expose no wear-level registers; derive health from observed errors
                 if has_mmcblk and smart["health"] is None:
                     smart["health"] = "GOOD" if (mmc_err == 0 and fs_err == 0) else "WARNING"
+                fs_root = self._fs_stats("/")
+                fs_boot = self._fs_stats("/boot")
                 snap = {
                     "has_mmcblk":       has_mmcblk,
                     "card_type":        card_type,
@@ -934,8 +971,8 @@ class SDCardThread(threading.Thread):
                     "power_on_hours":   smart["power_on_hours"],
                     "smart_attrs":      smart["attrs"],
                     "temp":             self._soc_temp(),
-                    "fs_root":          self._fs_stats("/"),
-                    "fs_boot":          self._fs_stats("/boot"),
+                    "fs_root":          fs_root,
+                    "fs_boot":          fs_boot,
                     "mmc_errors":       mmc_err,
                     "fs_errors":        fs_err,
                     "io_reads":         io["reads"]         if io else None,
@@ -946,6 +983,8 @@ class SDCardThread(threading.Thread):
                 }
                 with _state_lock:
                     _state["sdcard"] = snap
+                self._check_disk_alert("fs_root", "/", fs_root)
+                self._check_disk_alert("fs_boot", "/boot", fs_boot)
             except Exception:
                 pass
             self._stop.wait(SDCARD_REFRESH)
@@ -1253,7 +1292,7 @@ class FullRenderer:
         pct  = snap.get("disk_pct", 0)
         used = snap.get("disk_used", 0)
         tot  = snap.get("disk_total", 0)
-        c    = threshold_cp(pct, "ram_pct")
+        c    = threshold_cp(pct, "disk_pct")
         dr   = snap.get("disk_read", 0)
         dw_  = snap.get("disk_write", 0)
         if row < y + h:
@@ -1262,7 +1301,7 @@ class FullRenderer:
             self._add(row, x + w - 7, f"{pct:5.1f}%", c)
             row += 1
         if row < y + h:
-            self._bar(row, x, pct, w, "ram_pct")
+            self._bar(row, x, pct, w, "disk_pct")
             row += 1
         if row < y + h:
             self._add(row, x,        f"↓ {dr:6.1f} KB/s",  cp(CP_PRIMARY))
@@ -1621,7 +1660,7 @@ class FullRenderer:
             bw    = max(4, W - bar_x - 1)
             self._add(row, 0,        lbl,  cp(CP_SECONDARY, bold=True))
             self._add(row, len(lbl), info, cp(CP_PRIMARY))
-            self._bar(row, bar_x, pct, bw, "ram_pct")
+            self._bar(row, bar_x, pct, bw, "disk_pct")
             row += 1
         if row < cy + ch:
             self._label(row, 0, "I/O COUNTERS (since boot)")
@@ -1840,17 +1879,21 @@ class FullRenderer:
                     if not line:
                         continue
                     parts = line.split(",")
-                    if len(parts) != 5:
+                    # 5 columns = pre-1.1.0 rows (no voltage); 6 = current.
+                    if len(parts) not in (5, 6):
                         continue
                     try:
                         ts       = _dt.fromisoformat(parts[0])
                         cpu_temp = float(parts[3]) if parts[3] else None
+                        voltage  = (float(parts[5])
+                                    if len(parts) >= 6 and parts[5] else None)
                         rows.append({
                             "ts":       ts,
                             "cpu_pct":  float(parts[1]),
                             "ram_pct":  float(parts[2]),
                             "cpu_temp": cpu_temp,
                             "disk_pct": float(parts[4]),
+                            "voltage":  voltage,
                         })
                     except Exception:
                         pass
@@ -1941,7 +1984,8 @@ class FullRenderer:
             ("CPU %",    "cpu_pct",  "cpu_pct"),
             ("RAM %",    "ram_pct",  "ram_pct"),
             ("TEMP °C", "cpu_temp", "cpu_temp"),
-            ("DISK %",   "disk_pct", "ram_pct"),
+            ("DISK %",   "disk_pct", "disk_pct"),
+            ("VOLT V",   "voltage",  "voltage"),
         ]
 
         for label, key, thresh_key in metrics:
@@ -2007,7 +2051,9 @@ class FullRenderer:
 
             if row >= cy + ch:
                 break
-            self._label(row, 0, f"{label}  {latest:.1f}")
+            # Core voltage sits in a ~0.05V band; one decimal would flatten it.
+            latest_str = f"{latest:.4f}" if key == "voltage" else f"{latest:.1f}"
+            self._label(row, 0, f"{label}  {latest_str}")
             row += 1
 
             try:
@@ -2200,6 +2246,93 @@ def _curses_main(stdscr, args):
         t.join(timeout=2.0)
 
 
+def _print_report(as_json):
+    # One-shot snapshot for cron/email digests: no curses, no threads.
+    # Metrics.__init__ primes psutil cpu_percent across every process, which
+    # a report doesn't need — the probes used here are all stateless.
+    m = Metrics.__new__(Metrics)
+    now = _dt.now()
+
+    uptime_secs = time.time() - psutil.boot_time()
+    cpu_temp    = m._soc_temp()
+    gpu_temp    = m._gpu_temp()
+    voltage     = m._voltage()
+    throttled   = m._throttled()
+
+    watchdog = ServiceWatchdogThread()
+    services = []
+    for unit in WATCHED_SERVICES:
+        props = watchdog._query(unit)
+        if props is None:            # systemctl not available
+            services = None
+            break
+        services.append({
+            "unit":   unit,
+            "state":  props.get("ActiveState", "unknown"),
+            "sub":    props.get("SubState", ""),
+        })
+    failed = [s["unit"] for s in services or [] if s["state"] == "failed"]
+
+    disks = {
+        "/":     SDCardThread._fs_stats("/"),
+        "/boot": SDCardThread._fs_stats("/boot"),
+    }
+
+    if as_json:
+        report = {
+            "generated":   now.strftime("%Y-%m-%dT%H:%M:%S"),
+            "uptime_secs": round(uptime_secs, 1),
+            "cpu_temp_c":  cpu_temp,
+            "gpu_temp_c":  gpu_temp,
+            "core_volts":  voltage,
+            "throttled":   throttled,
+            "services":    services,
+            "failed_services": failed,
+            "disks": {
+                mount: (
+                    {"used": fs["used"], "total": fs["total"],
+                     "pct": round(fs["pct"], 1)}
+                    if fs else None
+                )
+                for mount, fs in disks.items()
+            },
+        }
+        print(json.dumps(report, indent=2))
+        return
+
+    def fmt(val, suffix=""):
+        return f"{val}{suffix}" if val is not None else "N/A"
+
+    print(f"SYSWATCH REPORT — {now.strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"Uptime:       {fmtup(uptime_secs)}")
+    print(f"CPU temp:     {fmt(cpu_temp, ' °C')}")
+    print(f"GPU temp:     {fmt(gpu_temp, ' °C')}")
+    print(f"Core voltage: {f'{voltage:.4f} V' if voltage is not None else 'N/A'}")
+    if throttled is not None:
+        flags = [("under-voltage", "uv"), ("freq-capped", "freq"),
+                 ("throttled", "throt"), ("soft-temp-limit", "temp")]
+        active = [n for n, k in flags if throttled.get(f"{k}_now")]
+        ever   = [n for n, k in flags if throttled.get(f"{k}_ever")]
+        print(f"Throttle now: {', '.join(active) if active else 'none'}")
+        print(f"Throttle ever:{' ' + ', '.join(ever) if ever else ' none'}")
+    else:
+        print("Throttle:     N/A")
+    if services is None:
+        print("Services:     N/A (systemctl not available)")
+    elif failed:
+        print(f"Services:     {len(failed)} FAILED — {', '.join(failed)}")
+    elif all(s["state"] == "unknown" for s in services):
+        print("Services:     state unknown (systemctl query failed)")
+    else:
+        print(f"Services:     all {len(services)} watched units OK")
+    for mount, fs in disks.items():
+        if fs is None:
+            print(f"Disk {mount:<7} N/A")
+        else:
+            print(f"Disk {mount:<7} {fmtb(fs['used'])}/{fmtb(fs['total'])}"
+                  f"  ({fs['pct']:.1f}% used)")
+
+
 def main():
     global REFRESH
     parser = argparse.ArgumentParser(
@@ -2219,12 +2352,23 @@ def main():
         help="disable the active ping sweep (passive ARP only)",
     )
     parser.add_argument(
-        "--version", action="version", version="syswatch 1.0.0",
+        "--report", action="store_true",
+        help="print a one-shot system report to stdout and exit (no TUI)",
+    )
+    parser.add_argument(
+        "--json", action="store_true",
+        help="with --report, output JSON instead of text",
+    )
+    parser.add_argument(
+        "--version", action="version", version="syswatch 1.1.0",
     )
     args = parser.parse_args()
     if args.refresh < 0.5:
         args.refresh = 0.5
     REFRESH = args.refresh
+    if args.report:
+        _print_report(args.json)
+        return
     try:
         curses.wrapper(lambda stdscr: _curses_main(stdscr, args))
     except KeyboardInterrupt:
