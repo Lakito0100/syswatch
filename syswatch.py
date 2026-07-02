@@ -1028,6 +1028,7 @@ class FullRenderer:
         win.timeout(100)
         win.keypad(True)
         self._hist_cache = None  # (loaded_at: float, rows: list)
+        self.hist_scroll_max = 0  # highest valid Tab 7 scroll offset (charts)
 
     # ── primitives ────────────────────────────────────────────────────────────
 
@@ -1902,7 +1903,7 @@ class FullRenderer:
         self._hist_cache = (now, rows)
         return rows
 
-    def _render_history(self, history_window):
+    def _render_history(self, history_window, history_scroll=0):
         H, W = self.win.getmaxyx()
         cy = 2
         ch = H - 3
@@ -1911,7 +1912,7 @@ class FullRenderer:
         window_secs   = [3600, 28800, 86400, 604800, 2592000]
         wlabel        = window_labels[history_window]
 
-        self._label(cy, 0, f"HISTORY — {wlabel}  [h] next window")
+        self._label(cy, 0, f"HISTORY — {wlabel}  [h] next window  [↑↓] scroll")
 
         rows = self._load_history()
         if not rows:
@@ -1988,10 +1989,20 @@ class FullRenderer:
             ("VOLT V",   "voltage",  "voltage"),
         ]
 
+        # Charts that actually have data in this window; scrolling steps
+        # through this list one whole chart at a time.
+        plotted = []
         for label, key, thresh_key in metrics:
             pairs = [(r["ts"], r[key]) for r in filtered if r.get(key) is not None]
-            if not pairs:
-                continue
+            if pairs:
+                plotted.append((label, key, thresh_key, pairs))
+        self.hist_scroll_max = max(0, len(plotted) - 1)
+        scroll = max(0, min(history_scroll, self.hist_scroll_max))
+        if scroll:
+            self._label(cy, 0, f"HISTORY — {wlabel}  [h] next window  "
+                               f"[↑↓] scroll ({scroll + 1}/{len(plotted)})")
+
+        for label, key, thresh_key, pairs in plotted[scroll:]:
             timestamps = [p[0] for p in pairs]
             values     = [p[1] for p in pairs]
 
@@ -2139,7 +2150,8 @@ class FullRenderer:
 
     # ── dispatch ──────────────────────────────────────────────────────────────
 
-    def render(self, active_tab, state, log_filter, mode, filter_buf, history_window=0):
+    def render(self, active_tab, state, log_filter, mode, filter_buf,
+               history_window=0, history_scroll=0):
         H, W = self.win.getmaxyx()
         self.win.erase()
         if H < self.MIN_H or W < self.MIN_W:
@@ -2157,7 +2169,7 @@ class FullRenderer:
         elif active_tab == 4: self._render_services(state)
         elif active_tab == 5: self._render_sdcard(state)
         elif active_tab == 6: self._render_backup(state)
-        elif active_tab == 7: self._render_history(history_window)
+        elif active_tab == 7: self._render_history(history_window, history_scroll)
         if mode == "filter_input":
             prompt = f" FILTER: {filter_buf}_ "
             self._add(H - 2, 2, prompt, cp(CP_HILIGHT, bold=True) | curses.A_REVERSE)
@@ -2178,6 +2190,7 @@ def _curses_main(stdscr, args):
     log_filter     = ""
     filter_buf     = ""
     history_window = 0
+    history_scroll = 0
     last_render    = 0.0
     alive          = [True]
 
@@ -2213,6 +2226,12 @@ def _curses_main(stdscr, args):
             elif ch == ord("h") and active_tab == 7:
                 history_window = (history_window + 1) % 5
                 last_render = 0.0
+            elif ch == curses.KEY_DOWN and active_tab == 7:
+                history_scroll = min(history_scroll + 1, renderer.hist_scroll_max)
+                last_render = 0.0
+            elif ch == curses.KEY_UP and active_tab == 7 and history_scroll > 0:
+                history_scroll -= 1
+                last_render = 0.0
             elif ch == ord("/") and active_tab == 3:
                 mode       = "filter_input"
                 filter_buf = log_filter
@@ -2237,7 +2256,8 @@ def _curses_main(stdscr, args):
         now = time.monotonic()
         if now - last_render >= REFRESH:
             state = get_state()
-            renderer.render(active_tab, state, log_filter, mode, filter_buf, history_window)
+            renderer.render(active_tab, state, log_filter, mode, filter_buf,
+                            history_window, history_scroll)
             last_render = now
 
     for t in threads:

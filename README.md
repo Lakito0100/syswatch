@@ -65,7 +65,7 @@ Reports the health of `/dev/mmcblk0` (SD card or eMMC). Tries `smartctl` first, 
 Reads `/var/log/project-backup-status.json` written by the `project-backup` tool. Displays the status, timestamp, duration, and file counts of the last backup run; lists configured source paths with existence checks; and shows a scrollable run history with a files-transferred sparkline.
 
 ### 7 · HISTORY
-Reads the metrics CSV recorded by syswatch-logger and renders line charts for CPU %, RAM %, CPU temperature, disk %, and core voltage over the selected time window. Press `h` while on this tab to cycle between the last 1 hour, 8 hours, 24 hours, 7 days, and 30 days. Each chart is coloured using the same warning/critical thresholds as the live display. If no data is available yet, a message prompts you to start syswatch-logger. When syswatch is launched with `sudo` (so `~` resolves to `/root`), it falls back to reading the invoking user's CSV at `/home/$SUDO_USER/.local/share/syswatch/metrics.csv`.
+Reads the metrics CSV recorded by syswatch-logger and renders line charts for CPU %, RAM %, CPU temperature, disk %, and core voltage over the selected time window. Press `h` while on this tab to cycle between the last 1 hour, 8 hours, 24 hours, 7 days, and 30 days. If the terminal is too short to fit all charts, press `↓`/`↑` to scroll one chart at a time — the header shows the current position while scrolled. Each chart is coloured using the same warning/critical thresholds as the live display. If no data is available yet, a message prompts you to start syswatch-logger. When syswatch is launched with `sudo` (so `~` resolves to `/root`), it falls back to reading the invoking user's CSV at `/home/$SUDO_USER/.local/share/syswatch/metrics.csv`.
 
 ---
 
