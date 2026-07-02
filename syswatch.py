@@ -1934,21 +1934,25 @@ class FullRenderer:
             timestamps = [p[0] for p in pairs]
             values     = [p[1] for p in pairs]
 
-            # True data span, captured before any resampling reshapes the lists
-            # so the time axis always reflects the real oldest/newest samples
-            # regardless of how the trim/stretch below cuts the tail.
-            true_oldest = timestamps[0]
-            true_newest = timestamps[-1]
-
             # Downsample to fit terminal width *before* detecting gaps, so the
             # trim can't change which jumps look like outages. down_step records
             # the trim factor; the kept points end up down_step× farther apart
-            # than the raw sample interval.
+            # than the raw sample interval. Stride from the newest sample
+            # backwards so the most recent reading is always kept — striding
+            # from the front (then trimming the tail) could silently drop the
+            # newest point and leave the chart showing a stale "latest" value.
             down_step = 1
             if len(values) > max_points:
                 down_step  = max(1, len(values) // max_points)
-                values     = values[::down_step][-max_points:]
-                timestamps = timestamps[::down_step][-max_points:]
+                values     = values[::-1][::down_step][:max_points][::-1]
+                timestamps = timestamps[::-1][::down_step][:max_points][::-1]
+
+            # True data span of what is actually plotted, captured *after*
+            # downsampling so the time axis reflects the real timestamps of the
+            # kept points rather than the pre-trim extremes (which the trim
+            # above may have cut away).
+            true_oldest = timestamps[0]
+            true_newest = timestamps[-1]
 
             # Gap detection for logger outages: any jump larger than 5× the
             # estimated sample interval means the logger was not running. We
