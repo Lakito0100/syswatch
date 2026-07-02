@@ -365,8 +365,21 @@ def push_alert(msg: str):
 
 
 def get_state():
+    # A shallow dict(_state) would still share the live "devices" dict and the
+    # "logs"/"log_errs"/"system_hist" deques with the background threads that
+    # keep mutating them — a renderer iterating those later (outside the lock)
+    # can crash with "dictionary changed size during iteration" or "deque
+    # mutated during iteration". Snapshot each of them into fresh containers
+    # here, while still holding the lock those threads mutate under.
     with _state_lock:
-        return dict(_state)
+        snap = dict(_state)
+        snap["devices"]   = dict(_state["devices"])
+        snap["logs"]      = list(_state["logs"])
+        snap["log_errs"]  = list(_state["log_errs"])
+        hist = _state.get("system_hist")
+        if hist is not None:
+            snap["system_hist"] = {k: list(v) for k, v in hist.items()}
+        return snap
 
 
 # ── device helpers ─────────────────────────────────────────────────────────────
@@ -435,9 +448,13 @@ class SystemThread(threading.Thread):
     def run(self):
         while not self._stop.is_set():
             try:
-                snap = self._metrics.collect()
-                self._check_temp_alert(snap)
+                # collect() appends to self._metrics.hist's deques, so it must
+                # run under the same lock get_state() uses to snapshot them —
+                # otherwise a reader can iterate a deque while this thread is
+                # mid-append and crash with "deque mutated during iteration".
                 with _state_lock:
+                    snap = self._metrics.collect()
+                    self._check_temp_alert(snap)
                     _state["system"]      = snap
                     _state["system_hist"] = self._metrics.hist
                     _state["pi_model"]    = self._metrics.pi_model
