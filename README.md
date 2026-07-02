@@ -34,6 +34,8 @@ syswatch [options]
 | `--tab N` | Start on tab N (1-7, default 1) |
 | `--refresh N` | Refresh interval in seconds (default 1.0, minimum 0.5) |
 | `--no-scan` | Disable active ping sweep; use passive ARP table only |
+| `--report` | Print a one-shot system report to stdout and exit (no TUI) |
+| `--json` | With `--report`, output JSON instead of text |
 | `--version` | Print version and exit |
 
 Press `q`, `Q`, or `Esc` to quit. Press `1`–`7` to switch tabs directly.
@@ -63,27 +65,70 @@ Reports the health of `/dev/mmcblk0` (SD card or eMMC). Tries `smartctl` first, 
 Reads `/var/log/project-backup-status.json` written by the `project-backup` tool. Displays the status, timestamp, duration, and file counts of the last backup run; lists configured source paths with existence checks; and shows a scrollable run history with a files-transferred sparkline.
 
 ### 7 · HISTORY
-Reads the metrics CSV recorded by syswatch-logger and renders line charts for CPU %, RAM %, CPU temperature, and disk % over the selected time window. Press `h` while on this tab to cycle between the last 1 hour, 8 hours, 24 hours, 7 days, and 30 days. Each chart is coloured using the same warning/critical thresholds as the live display. If no data is available yet, a message prompts you to start syswatch-logger. When syswatch is launched with `sudo` (so `~` resolves to `/root`), it falls back to reading the invoking user's CSV at `/home/$SUDO_USER/.local/share/syswatch/metrics.csv`.
+Reads the metrics CSV recorded by syswatch-logger and renders line charts for CPU %, RAM %, CPU temperature, disk %, and core voltage over the selected time window. Press `h` while on this tab to cycle between the last 1 hour, 8 hours, 24 hours, 7 days, and 30 days. If the terminal is too short to fit all charts, press `↓`/`↑` to scroll one chart at a time — the header shows the current position while scrolled. Each chart is coloured using the same warning/critical thresholds as the live display. If no data is available yet, a message prompts you to start syswatch-logger. When syswatch is launched with `sudo` (so `~` resolves to `/root`), it falls back to reading the invoking user's CSV at `/home/$SUDO_USER/.local/share/syswatch/metrics.csv`.
 
 ---
 
 ## syswatch-logger
 
-syswatch-logger is a lightweight background process that wakes up every 2 minutes (120 seconds, the default `--interval`), samples CPU %, RAM %, CPU temperature, and root-disk usage, and appends one CSV line to `~/.local/share/syswatch/metrics.csv`. Lines older than 30 days are trimmed automatically after each write.
+syswatch-logger is a lightweight background process that wakes up every 2 minutes (120 seconds, the default `--interval`), samples CPU %, RAM %, CPU temperature, root-disk usage, and core voltage, and appends one CSV line to `~/.local/share/syswatch/metrics.csv`. Lines older than 30 days are trimmed automatically after each write.
 
 `install-syswatch.sh` installs and starts syswatch-logger as a systemd service (`syswatch-logger.service`) running as the installed user. The service starts automatically on boot and restarts on failure.
 
 **CSV location:** `~/.local/share/syswatch/metrics.csv`
 
-Example rows (2-minute spacing):
+Example rows (2-minute spacing; columns are timestamp, CPU %, RAM %, CPU temp, disk %, core voltage):
 ```
-2026-06-11T14:35:00,32.1,45.2,56.3,12.4
-2026-06-11T14:37:00,34.0,46.1,57.0,12.4
+2026-06-11T14:35:00,32.1,45.2,56.3,12.4,1.3125
+2026-06-11T14:37:00,34.0,46.1,57.0,12.4,1.3125
 ```
+
+Rows written by versions before 1.1.0 have five columns (no voltage). They stay fully compatible — the HISTORY tab reads both formats, so there is no need to delete or migrate an existing `metrics.csv`; old rows simply have no voltage value.
 
 To run the logger directly (e.g. for testing): `python3 syswatch-logger.py [--interval N] [--version]`
 
 To change the sample interval permanently, add `--interval N` (seconds) to the `ExecStart=` line in `/etc/systemd/system/syswatch-logger.service`, then run `sudo systemctl daemon-reload && sudo systemctl restart syswatch-logger`. The HISTORY tab estimates the interval from the data, so its gap detection adapts automatically.
+
+---
+
+## Report mode
+
+`syswatch --report` prints a one-shot snapshot to stdout and exits — no TUI, no background threads. It includes uptime, CPU/GPU temperature, core voltage, throttle flags (current and since boot), the state of every watched service (failed units are called out), and disk usage for `/` and `/boot`. Add `--json` for machine-readable output.
+
+This is designed for cron and email digests, e.g. a daily report at 07:00:
+
+```
+0 7 * * * /usr/local/bin/syswatch --report | mail -s "Pi status" you@example.com
+```
+
+Values that cannot be read on the current hardware (e.g. `vcgencmd` temperatures on a non-Pi machine) are reported as `N/A` in text mode and `null` in JSON.
+
+> Note: on Raspberry Pi OS Bookworm and later the boot partition is mounted at `/boot/firmware`; the `/boot` line then reflects the root filesystem. This matches the SD CARD tab's existing behaviour.
+
+---
+
+## Disk space alert
+
+Like the temperature alert, syswatch monitors filesystem usage of `/` and `/boot` (checked every 60 seconds by the SD-card watcher). When usage crosses a threshold for the first time, it rings the terminal bell (`\a`) and appends a timestamped line to:
+
+```
+~/.local/share/syswatch/disk_alerts.log
+```
+
+The alert fires once per upward crossing per mount — it will not repeat every cycle while usage stays high, but will fire again if usage drops below the threshold and rises back above it.
+
+Thresholds (configurable in `THRESH["disk_pct"]` at the top of `syswatch.py`):
+- **WARNING** — 85 % used
+- **CRITICAL** — 95 % used
+
+These thresholds also colour the disk-usage bars on the SYSTEM, SD CARD, and HISTORY tabs.
+
+Example log entries:
+
+```
+2026-07-02 09:14:03 WARNING disk=/ 86.2% (threshold=85%)
+2026-07-02 11:41:56 CRITICAL disk=/boot 95.4% (threshold=95%)
+```
 
 ---
 
