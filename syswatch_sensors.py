@@ -306,15 +306,25 @@ def _read_storage_temp_smartctl(base, kind):
             data = json.loads(r.stdout)
         except Exception:
             continue
+        if not isinstance(data, dict):
+            continue
         nvme_log = data.get("nvme_smart_health_information_log")
-        if nvme_log and "temperature" in nvme_log:
+        if isinstance(nvme_log, dict) and "temperature" in nvme_log:
             try:
                 return float(nvme_log["temperature"])
             except Exception:
                 pass
-        for attr in data.get("ata_smart_attributes", {}).get("table", []):
+        # smartctl can emit "ata_smart_attributes": null (e.g. on an NVMe
+        # device queried without --device=nvme) rather than omitting the key,
+        # so .get(..., {}) alone doesn't guard against a None here.
+        ata_attrs = data.get("ata_smart_attributes")
+        table = ata_attrs.get("table") if isinstance(ata_attrs, dict) else None
+        for attr in table or []:
+            if not isinstance(attr, dict):
+                continue
             if attr.get("id") == 194 or "Temperature" in attr.get("name", ""):
-                raw = attr.get("raw", {}).get("value")
+                raw = attr.get("raw", {})
+                raw = raw.get("value") if isinstance(raw, dict) else None
                 try:
                     return float(str(raw).split()[0])
                 except Exception:

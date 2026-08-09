@@ -1112,8 +1112,16 @@ class FullRenderer:
         filled = max(0, min(inner, int(pct / 100 * inner)))
         c      = threshold_cp(pct, key) if key else cp(CP_PRIMARY)
         self._add(y, x,                "[",                     cp(CP_SECONDARY))
-        self._add(y, x + 1,            "▰" * filled,            c)
-        self._add(y, x + 1 + filled,   "▱" * (inner - filled),  cp(CP_DIM))
+        # █/░ (Block Elements, U+2588/U+2591) rather than the parallelogram
+        # glyphs (U+25B0/U+25B1, Geometric Shapes) — the latter are missing
+        # from enough monospace fonts that a terminal falls back to a
+        # substitute glyph with different advance width, and since a bar is
+        # dozens of these in a row, even a small per-glyph width error
+        # compounds into the whole row (and everything after it) drifting
+        # far past its intended column, visually swallowing the next panel.
+        # Block Elements are part of code page 437 and universally supported.
+        self._add(y, x + 1,            "█" * filled,            c)
+        self._add(y, x + 1 + filled,   "░" * (inner - filled),  cp(CP_DIM))
         self._add(y, x + 1 + inner,    "]",                     cp(CP_SECONDARY))
 
     def _label(self, y, x, text, width=None):
@@ -1352,7 +1360,7 @@ class FullRenderer:
             elif key == "cpu_temp":
                 self._add(row, x + lw, sensors.cpu_temp_hint(), cp(CP_MUTED))
             else:
-                self._add(row, x + lw, "▱" * bw2 + " N/A", cp(CP_DIM))
+                self._add(row, x + lw, "░" * bw2 + " N/A", cp(CP_DIM))
             row += 1
 
     def _draw_network_sys(self, y, x, h, w, snap, hist):
