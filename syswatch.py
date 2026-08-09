@@ -308,6 +308,12 @@ class Metrics:
             swap_used=swap.used, swap_total=swap.total, swap_pct=swap.percent,
         )
 
+        try:
+            batt = psutil.sensors_battery()
+        except Exception:
+            batt = None
+        s["battery_pct"] = batt.percent if batt is not None else None
+
         is_pi    = sensors.is_pi()
         gpu_info = None if is_pi else sensors.gpu_temp()
         ct       = self._soc_temp()
@@ -423,7 +429,7 @@ class SystemThread(threading.Thread):
     def __init__(self):
         super().__init__(daemon=True)
         self._metrics           = Metrics()
-        self._stop              = threading.Event()
+        self._stop_event        = threading.Event()
         self._temp_alert_level  = 0  # 0=ok, 1=warning, 2=critical
 
     def _write_temp_alert(self, msg):
@@ -454,7 +460,7 @@ class SystemThread(threading.Thread):
         self._temp_alert_level = level
 
     def run(self):
-        while not self._stop.is_set():
+        while not self._stop_event.is_set():
             try:
                 # collect() appends to self._metrics.hist's deques, so it must
                 # run under the same lock get_state() uses to snapshot them —
@@ -468,17 +474,17 @@ class SystemThread(threading.Thread):
                     _state["model"]       = self._metrics.model
             except Exception:
                 pass
-            self._stop.wait(REFRESH)
+            self._stop_event.wait(REFRESH)
 
     def stop(self):
-        self._stop.set()
+        self._stop_event.set()
 
 
 # ── ARPPassiveThread ───────────────────────────────────────────────────────────
 class ARPPassiveThread(threading.Thread):
     def __init__(self):
         super().__init__(daemon=True)
-        self._stop = threading.Event()
+        self._stop_event = threading.Event()
 
     def _parse_arp_table(self):
         result = {}
@@ -497,7 +503,7 @@ class ARPPassiveThread(threading.Thread):
         return result
 
     def run(self):
-        while not self._stop.is_set():
+        while not self._stop_event.is_set():
             try:
                 now    = time.time()
                 parsed = self._parse_arp_table()
@@ -536,18 +542,18 @@ class ARPPassiveThread(threading.Thread):
                             dev.status    = _device_status(dev)
             except Exception:
                 pass
-            self._stop.wait(ARP_REFRESH)
+            self._stop_event.wait(ARP_REFRESH)
 
     def stop(self):
-        self._stop.set()
+        self._stop_event.set()
 
 
 # ── PingSweepThread ────────────────────────────────────────────────────────────
 class PingSweepThread(threading.Thread):
     def __init__(self, enabled=True):
         super().__init__(daemon=True)
-        self._stop     = threading.Event()
-        self._enabled  = enabled
+        self._stop_event = threading.Event()
+        self._enabled    = enabled
         self._networks = []  # local networks to sweep, from sensors.local_networks()
 
     @staticmethod
@@ -622,15 +628,15 @@ class PingSweepThread(threading.Thread):
 
     def run(self):
         self._networks = self._detect_networks()
-        while not self._stop.is_set():
+        while not self._stop_event.is_set():
             if not self._enabled:
-                self._stop.wait(PING_CYCLE)
+                self._stop_event.wait(PING_CYCLE)
                 continue
             try:
                 ips   = self._all_ips()
                 delay = PING_CYCLE / max(1, len(ips) / PING_BATCH)
                 for i in range(0, len(ips), PING_BATCH):
-                    if self._stop.is_set():
+                    if self._stop_event.is_set():
                         return
                     alive = self._ping_batch(ips[i:i + PING_BATCH])
                     now   = time.time()
@@ -640,19 +646,19 @@ class PingSweepThread(threading.Thread):
                                 if dev.ip == ip:
                                     dev.last_seen = now
                                     dev.status    = _device_status(dev)
-                    self._stop.wait(delay)
+                    self._stop_event.wait(delay)
             except Exception:
-                self._stop.wait(PING_CYCLE)
+                self._stop_event.wait(PING_CYCLE)
 
     def stop(self):
-        self._stop.set()
+        self._stop_event.set()
 
 
 # ── LogThread ──────────────────────────────────────────────────────────────────
 class LogThread(threading.Thread):
     def __init__(self):
         super().__init__(daemon=True)
-        self._stop = threading.Event()
+        self._stop_event = threading.Event()
         self._proc = None
 
     def _launch(self):
@@ -702,9 +708,9 @@ class LogThread(threading.Thread):
 
     def run(self):
         self._launch()
-        while not self._stop.is_set():
+        while not self._stop_event.is_set():
             if self._proc is None:
-                self._stop.wait(5.0)
+                self._stop_event.wait(5.0)
                 self._launch()
                 continue
             try:
@@ -714,7 +720,7 @@ class LogThread(threading.Thread):
                 continue
             if line == b"":
                 self._reap()
-                self._stop.wait(5.0)
+                self._stop_event.wait(5.0)
                 continue
             entry = self._parse_line(line)
             if entry:
@@ -727,7 +733,7 @@ class LogThread(threading.Thread):
                     push_alert(f"[{entry['unit']}] {entry['message'][:60]}")
 
     def stop(self):
-        self._stop.set()
+        self._stop_event.set()
         if self._proc:
             try:
                 self._proc.terminate()
@@ -739,7 +745,7 @@ class LogThread(threading.Thread):
 class ServiceWatchdogThread(threading.Thread):
     def __init__(self):
         super().__init__(daemon=True)
-        self._stop        = threading.Event()
+        self._stop_event   = threading.Event()
         self._prev_states = {}
         self._available   = True
 
@@ -765,11 +771,11 @@ class ServiceWatchdogThread(threading.Thread):
             return {"unit": unit, "ActiveState": "unknown"}
 
     def run(self):
-        while not self._stop.is_set():
+        while not self._stop_event.is_set():
             if not self._available:
                 with _state_lock:
                     _state["services"] = None
-                self._stop.wait(WATCHDOG_REFRESH)
+                self._stop_event.wait(WATCHDOG_REFRESH)
                 continue
             try:
                 results = []
@@ -788,17 +794,17 @@ class ServiceWatchdogThread(threading.Thread):
                         _state["services"] = results
             except Exception:
                 pass
-            self._stop.wait(WATCHDOG_REFRESH)
+            self._stop_event.wait(WATCHDOG_REFRESH)
 
     def stop(self):
-        self._stop.set()
+        self._stop_event.set()
 
 
 # ── StorageThread ────────────────────────────────────────────────────────────
 class StorageThread(threading.Thread):
     def __init__(self):
         super().__init__(daemon=True)
-        self._stop = threading.Event()
+        self._stop_event = threading.Event()
         # 0=ok, 1=warning, 2=critical — per mount, mirrors _temp_alert_level.
         # The boot-mount key is added lazily once the mount is known.
         self._disk_alert_level = {"fs_root": 0}
@@ -981,7 +987,7 @@ class StorageThread(threading.Thread):
         return dev_errors, fs_errors
 
     def run(self):
-        while not self._stop.is_set():
+        while not self._stop_event.is_set():
             try:
                 dev    = sensors.root_device()
                 base   = dev["base"]
@@ -1025,10 +1031,10 @@ class StorageThread(threading.Thread):
                     self._check_disk_alert(boot, boot, fs_boot)
             except Exception:
                 pass
-            self._stop.wait(SDCARD_REFRESH)
+            self._stop_event.wait(SDCARD_REFRESH)
 
     def stop(self):
-        self._stop.set()
+        self._stop_event.set()
 
 
 # ── BackupStatusThread ────────────────────────────────────────────────────────
@@ -1037,22 +1043,28 @@ class BackupStatusThread(threading.Thread):
 
     def __init__(self):
         super().__init__(daemon=True)
-        self._stop = threading.Event()
+        self._stop_event = threading.Event()
 
     def run(self):
-        while not self._stop.is_set():
+        while not self._stop_event.is_set():
             try:
                 with open(self.STATUS_FILE) as f:
                     data = json.load(f)
+                # project-backup writes this file; a stale/half-written or
+                # unexpected-schema version (valid JSON, but not an object —
+                # e.g. null, a list, a bare number) would otherwise crash
+                # _render_backup's dict-only access on the next render.
+                if not isinstance(data, dict):
+                    data = None
                 with _state_lock:
                     _state["backup"] = data
             except Exception:
                 with _state_lock:
                     _state["backup"] = None
-            self._stop.wait(15)
+            self._stop_event.wait(15)
 
     def stop(self):
-        self._stop.set()
+        self._stop_event.set()
 
 
 # ── FullRenderer ───────────────────────────────────────────────────────────────
@@ -1242,6 +1254,13 @@ class FullRenderer:
             row += 1
             self._bar(row, x, pct, w, "ram_pct")
             row += 1
+        batt_pct = snap.get("battery_pct")
+        if batt_pct is not None and row + 1 < y + h:
+            self._add(row, x,         "BATT",          cp(CP_SECONDARY, bold=True))
+            self._add(row, x + w - 7, f"{batt_pct:5.1f}%", cp(CP_PRIMARY))
+            row += 1
+            self._bar(row, x, batt_pct, w)
+            row += 1
         ram_hist = (hist or {}).get("ram", [])
         if row < y + h and len(ram_hist) >= 2:
             spark_color = self._spark_attr(ram_hist, "ram_pct")
@@ -1266,7 +1285,6 @@ class FullRenderer:
         self._label(y, x, title, w)
         if not snap or h < 2:
             return
-        bw   = max(4, w - 20)
         row  = y + 1
         gpu_label = "GPU TEMP"
         if not snap.get("is_pi") and snap.get("gpu_vendor"):
@@ -1281,6 +1299,15 @@ class FullRenderer:
             "gpu_temp":     "gpu_temp",
             "storage_temp": "storage_temp",
         }
+        temp_row_keys = [k for k in self._temp_rows(snap) if k in temp_labels]
+        # Size the label column to the longest label actually shown this frame
+        # (e.g. "GPU TEMP (NVIDIA)") instead of a fixed 13 — a fixed width let
+        # the bar start before the label text ended, overwriting it. Capped so
+        # a narrow panel still leaves room for the bar and value.
+        lw = 13
+        if temp_row_keys:
+            lw = max(lw, max(len(temp_labels[k]) for k in temp_row_keys) + 1)
+        lw = min(lw, max(13, w - 12))
         for key in self._temp_rows(snap):
             if row >= y + h:
                 break
@@ -1314,11 +1341,10 @@ class FullRenderer:
                 row += 1
                 continue
             # temperature row
-            label = temp_labels[key]
+            label = temp_labels[key][:lw]
             v     = snap.get(key)
             c     = threshold_cp(v, temp_thresh_key[key])
-            self._add(row, x, f"{label:<13}", cp(CP_SECONDARY))
-            lw    = 13
+            self._add(row, x, f"{label:<{lw}}", cp(CP_SECONDARY))
             bw2   = max(4, w - lw - 8)
             if v is not None:
                 self._bar(row, x + lw, min(100.0, v / 90.0 * 100), bw2)
@@ -1471,9 +1497,13 @@ class FullRenderer:
         sorted_devs = sorted(devices.values(), key=lambda d: d.last_seen, reverse=True)
         count_str   = f"  {len(sorted_devs)} device(s)"
         self._add(cy, max(0, W - len(count_str) - 1), count_str, cp(CP_SECONDARY))
+        # HOSTNAME is the one field with genuinely variable-length content, so it
+        # absorbs any extra terminal width instead of leaving the rest of a wide
+        # window blank after a fixed 20-column table.
+        hn_w = max(20, W - (15 + 2 + 17 + 2 + 2 + 12 + 2 + 10))
         hdr_row = cy + 1
         self._add(hdr_row, 0,
-                  f"{'IP':<15}  {'MAC':<17}  {'HOSTNAME':<20}  {'LAST SEEN':<12}  STATUS",
+                  f"{'IP':<15}  {'MAC':<17}  {'HOSTNAME':<{hn_w}}  {'LAST SEEN':<12}  STATUS",
                   cp(CP_PRIMARY, bold=True))
         self._hline(hdr_row + 1, 0, "─", W, cp(CP_DIM))
         row = hdr_row + 2
@@ -1497,8 +1527,8 @@ class FullRenderer:
                 age_str = f"{int(age // 60)}m ago"
             else:
                 age_str = f"{int(age // 3600)}h ago"
-            hn   = (dev.hostname if dev.hostname != dev.ip else "-")[:20]
-            line = (f"{dev.ip:<15}  {dev.mac:<17}  {hn:<20}  "
+            hn   = (dev.hostname if dev.hostname != dev.ip else "-")[:hn_w]
+            line = (f"{dev.ip:<15}  {dev.mac:<17}  {hn:<{hn_w}}  "
                     f"{age_str:<12}  {status}")
             self._add(row, 0, line[:W], c)
             row += 1
@@ -1795,6 +1825,8 @@ class FullRenderer:
         row += 1
 
         last_run = backup.get("last_run")
+        if not isinstance(last_run, dict):
+            last_run = None  # stale/malformed status file — treat like "no run yet"
 
         if last_run is None:
             if row < cy + ch:
@@ -1809,6 +1841,12 @@ class FullRenderer:
             files_xfer      = last_run.get("files_transferred", 0)
             files_unch      = last_run.get("files_unchanged", 0)
             total_size_h    = last_run.get("total_size_human", "N/A")
+            if not isinstance(duration_s, (int, float)):
+                duration_s = None
+            if not isinstance(files_xfer, (int, float)):
+                files_xfer = 0
+            if not isinstance(files_unch, (int, float)):
+                files_unch = 0
 
             if status == "ok":
                 s_str, s_c = "OK",    cp(CP_GOOD, bold=True)
@@ -1852,11 +1890,17 @@ class FullRenderer:
             self._label(row, 0, "SOURCES")
             row += 1
 
-        config  = backup.get("config") or {}
+        config = backup.get("config")
+        if not isinstance(config, dict):
+            config = {}
         sources = config.get("sources") or []
+        if not isinstance(sources, list):
+            sources = []
         for path in sources:
             if row >= cy + ch:
                 break
+            if not isinstance(path, str):
+                continue
             exists = os.path.exists(path)
             if exists:
                 self._add(row, 2, path,           cp(CP_GOOD))
@@ -1872,6 +1916,8 @@ class FullRenderer:
             row += 1
 
         history = backup.get("history") or []
+        if not isinstance(history, list):
+            history = []
 
         if not history:
             if row < cy + ch:
@@ -1892,13 +1938,23 @@ class FullRenderer:
         for entry in history:
             if row >= cy + ch:
                 break
+            if not isinstance(entry, dict):
+                continue
             ts       = entry.get("timestamp", "")
+            if not isinstance(ts, str):
+                ts = ""
             date     = ts[:10] if len(ts) >= 10 else ts
             time_str = ts[11:19] if len(ts) >= 19 else ""
             estatus  = entry.get("status", "")
+            if not isinstance(estatus, str):
+                estatus = ""
             efiles   = entry.get("files_transferred", 0)
+            if not isinstance(efiles, (int, float)):
+                efiles = 0
             esize    = entry.get("total_size_human", "")
             edur_s   = entry.get("duration_s")
+            if not isinstance(edur_s, (int, float)):
+                edur_s = None
 
             if edur_s is not None:
                 if edur_s >= 60:
@@ -1925,7 +1981,10 @@ class FullRenderer:
             label    = "TRANSFER HISTORY  "
             spark_w  = W - len(label)
             if spark_w > 0:
-                spark_data = [e.get("files_transferred", 0) for e in history]
+                spark_data = []
+                for e in history:
+                    v = e.get("files_transferred", 0) if isinstance(e, dict) else 0
+                    spark_data.append(v if isinstance(v, (int, float)) else 0)
                 self._add(row, 0,          label,                      cp(CP_MUTED))
                 self._add(row, len(label), sparkline(spark_data, spark_w), cp(CP_PRIMARY))
 
@@ -1976,7 +2035,7 @@ class FullRenderer:
                         continue
                     parts = line.split(",")
                     # 5 cols = pre-1.1.0 (no voltage); 6 = 1.1.x (+voltage);
-                    # 8 = current (+gpu_temp, +storage_temp).
+                    # 8 = 1.2.0 (+gpu_temp, +storage_temp); 9 = current (+battery_pct).
                     if len(parts) < 5:
                         continue
                     try:
@@ -1992,9 +2051,15 @@ class FullRenderer:
                         "voltage":       self._col(parts, 5),
                         "gpu_temp":      self._col(parts, 6),
                         "storage_temp":  self._col(parts, 7),
+                        "battery_pct":   self._col(parts, 8),
                     })
         except Exception:
             pass
+        # _render_history assumes chronological order (filtered[0]/[-1] as the
+        # oldest/newest bound of the resample grid); an out-of-order CSV — clock
+        # adjustments, concatenated files, manual edits — would otherwise send
+        # the bin-index math negative and crash with an IndexError.
+        rows.sort(key=lambda r: r["ts"])
         self._hist_cache = (now, rows)
         return rows
 
@@ -2042,6 +2107,12 @@ class FullRenderer:
             n = len(deltas)
             sample_interval = (deltas[n // 2] if n % 2
                                else (deltas[n // 2 - 1] + deltas[n // 2]) / 2)
+            # A median of 0 (many duplicate/near-duplicate timestamps — bad
+            # clock resolution, manually edited/concatenated CSVs) would
+            # otherwise divide-by-zero in the resampling below; it also isn't
+            # a meaningful interval, so fall back to the same floor used when
+            # there isn't enough data to estimate one at all.
+            sample_interval = max(sample_interval, 1.0)
         else:
             sample_interval = 120.0
 
@@ -2084,6 +2155,7 @@ class FullRenderer:
             ("VOLT V",    "voltage",      "voltage"),
             ("GPU °C",    "gpu_temp",     "gpu_temp"),
             ("SSD °C",    "storage_temp", "storage_temp"),
+            ("BATT %",    "battery_pct",  "battery_pct"),
         ]
 
         # Charts that actually have data in this window; scrolling steps

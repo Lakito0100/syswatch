@@ -99,6 +99,10 @@ def main():
             volt  = _core_voltage()
             gtemp = sensors.gpu_temp()
             stemp = sensors.storage_temp()
+            try:
+                batt = psutil.sensors_battery()
+            except Exception:
+                batt = None
             ts    = _dt.now().strftime("%Y-%m-%dT%H:%M:%S")
             temp_str  = f"{temp:.1f}" if temp is not None else ""
             # 4 decimals: core voltage moves in ~0.0125V steps, .1f would
@@ -106,8 +110,9 @@ def main():
             volt_str  = f"{volt:.4f}" if volt is not None else ""
             gtemp_str = f"{gtemp['temp']:.1f}" if gtemp is not None else ""
             stemp_str = f"{stemp:.1f}" if stemp is not None else ""
+            batt_str  = f"{batt.percent:.1f}" if batt is not None else ""
             line = (f"{ts},{cpu:.1f},{mem:.1f},{temp_str},{disk:.1f},"
-                     f"{volt_str},{gtemp_str},{stemp_str}\n")
+                     f"{volt_str},{gtemp_str},{stemp_str},{batt_str}\n")
             with open(csv_path, "a") as f:
                 f.write(line)
             _trim(csv_path)
