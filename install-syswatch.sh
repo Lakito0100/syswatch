@@ -59,10 +59,15 @@ do_install() {
 
     echo "Installing syswatch..."
 
-    # 1. Copy syswatch.py to lib directory
+    # 1. Copy syswatch.py and its shared sensor module to lib directory
     install -d -m 755 "$LIB_DIR"
     install -m 755 "$SRC" "$LIB_DIR/syswatch.py"
     echo "  Installed $LIB_DIR/syswatch.py"
+
+    SRC_SENSORS="$SCRIPT_DIR/syswatch_sensors.py"
+    [[ -f "$SRC_SENSORS" ]] || die "syswatch_sensors.py not found in $SCRIPT_DIR"
+    install -m 755 "$SRC_SENSORS" "$LIB_DIR/syswatch_sensors.py"
+    echo "  Installed $LIB_DIR/syswatch_sensors.py"
 
     # 2. Create wrapper in /usr/local/bin
     cat > "$BIN_FILE" <<'EOF'
