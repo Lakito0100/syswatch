@@ -25,27 +25,15 @@ def _bootstrap():
 _bootstrap()
 import psutil
 
-
-def _cpu_temp():
-    try:
-        with open("/sys/class/thermal/thermal_zone0/temp") as f:
-            return round(int(f.read().strip()) / 1000, 1)
-    except Exception:
-        pass
-    try:
-        r = subprocess.run(
-            ["vcgencmd", "measure_temp"],
-            capture_output=True, text=True, timeout=0.5,
-        )
-        raw = r.stdout.strip()
-        if raw and "temp=" in raw:
-            return float(raw.split("=")[1].strip("'C "))
-    except Exception:
-        pass
-    return None
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import syswatch_sensors as sensors
 
 
 def _core_voltage():
+    # Pi-only: vcgencmd doesn't exist elsewhere, and there's no portable
+    # equivalent for core voltage on other hardware.
+    if not sensors.is_pi():
+        return None
     try:
         r = subprocess.run(
             ["vcgencmd", "measure_volts", "core"],
@@ -91,7 +79,7 @@ def main():
         help="sample interval in seconds (default 120)",
     )
     parser.add_argument(
-        "--version", action="version", version="syswatch-logger 1.1.0",
+        "--version", action="version", version=f"syswatch-logger {sensors.VERSION}",
     )
     args = parser.parse_args()
 
@@ -104,17 +92,27 @@ def main():
 
     while True:
         try:
-            cpu  = psutil.cpu_percent(interval=None)
-            mem  = psutil.virtual_memory().percent
-            temp = _cpu_temp()
-            disk = psutil.disk_usage("/").percent
-            volt = _core_voltage()
-            ts   = _dt.now().strftime("%Y-%m-%dT%H:%M:%S")
-            temp_str = f"{temp:.1f}" if temp is not None else ""
+            cpu   = psutil.cpu_percent(interval=None)
+            mem   = psutil.virtual_memory().percent
+            temp  = sensors.cpu_temp()
+            disk  = psutil.disk_usage("/").percent
+            volt  = _core_voltage()
+            gtemp = sensors.gpu_temp()
+            stemp = sensors.storage_temp()
+            try:
+                batt = psutil.sensors_battery()
+            except Exception:
+                batt = None
+            ts    = _dt.now().strftime("%Y-%m-%dT%H:%M:%S")
+            temp_str  = f"{temp:.1f}" if temp is not None else ""
             # 4 decimals: core voltage moves in ~0.0125V steps, .1f would
             # collapse the whole series to one flat value.
-            volt_str = f"{volt:.4f}" if volt is not None else ""
-            line = f"{ts},{cpu:.1f},{mem:.1f},{temp_str},{disk:.1f},{volt_str}\n"
+            volt_str  = f"{volt:.4f}" if volt is not None else ""
+            gtemp_str = f"{gtemp['temp']:.1f}" if gtemp is not None else ""
+            stemp_str = f"{stemp:.1f}" if stemp is not None else ""
+            batt_str  = f"{batt.percent:.1f}" if batt is not None else ""
+            line = (f"{ts},{cpu:.1f},{mem:.1f},{temp_str},{disk:.1f},"
+                     f"{volt_str},{gtemp_str},{stemp_str},{batt_str}\n")
             with open(csv_path, "a") as f:
                 f.write(line)
             _trim(csv_path)
