@@ -45,7 +45,14 @@ do_uninstall() {
     else
         echo "  $LIB_DIR not found, skipping."
     fi
+    DOC_DIR="/usr/share/doc/syswatch"
+    if [[ -d "$DOC_DIR" ]]; then
+        rm -rf "$DOC_DIR"
+        echo "  Removed $DOC_DIR"
+    fi
     echo "syswatch uninstalled."
+    echo "Note: ~/.config/syswatch/, ~/.local/share/syswatch/ (metrics, alert logs,"
+    echo "known devices) were left in place."
 }
 
 # ── install ───────────────────────────────────────────────────────────────────
@@ -68,6 +75,16 @@ do_install() {
     [[ -f "$SRC_SENSORS" ]] || die "syswatch_sensors.py not found in $SCRIPT_DIR"
     install -m 755 "$SRC_SENSORS" "$LIB_DIR/syswatch_sensors.py"
     echo "  Installed $LIB_DIR/syswatch_sensors.py"
+
+    SRC_CONFIG="$SCRIPT_DIR/syswatch_config.py"
+    [[ -f "$SRC_CONFIG" ]] || die "syswatch_config.py not found in $SCRIPT_DIR"
+    install -m 755 "$SRC_CONFIG" "$LIB_DIR/syswatch_config.py"
+    echo "  Installed $LIB_DIR/syswatch_config.py"
+
+    SRC_DEVICES="$SCRIPT_DIR/syswatch_known_devices.py"
+    [[ -f "$SRC_DEVICES" ]] || die "syswatch_known_devices.py not found in $SCRIPT_DIR"
+    install -m 755 "$SRC_DEVICES" "$LIB_DIR/syswatch_known_devices.py"
+    echo "  Installed $LIB_DIR/syswatch_known_devices.py"
 
     # 2. Create wrapper in /usr/local/bin
     cat > "$BIN_FILE" <<'EOF'
@@ -106,11 +123,28 @@ EOF
         fi
     fi
 
-    # 5. Verify install
+    # 5. Install a commented example config to the doc dir. Never touches a
+    # user's real config at ~/.config/syswatch/ — this is documentation only.
+    DOC_DIR="/usr/share/doc/syswatch"
+    install -d -m 755 "$DOC_DIR"
+    EXAMPLE_TMP="$(mktemp)"
+    if PYTHONPATH="$LIB_DIR" python3 -c \
+        "import syswatch_config, sys; sys.stdout.write(syswatch_config.example_config_text())" \
+        > "$EXAMPLE_TMP" 2>/dev/null; then
+        install -m 644 "$EXAMPLE_TMP" "$DOC_DIR/config.example.toml"
+        echo "  Installed $DOC_DIR/config.example.toml"
+    else
+        echo "  WARNING: could not generate config.example.toml"
+    fi
+    rm -f "$EXAMPLE_TMP"
+
+    # 6. Verify install
     echo "  Verifying install..."
     if "$BIN_FILE" --version; then
         echo ""
         echo "syswatch installed. Run it from anywhere with: syswatch"
+        echo "See $DOC_DIR/config.example.toml for configuration options"
+        echo "(copy to ~/.config/syswatch/config.toml or run: syswatch --write-default-config)."
     else
         die "Verification failed — syswatch --version did not succeed."
     fi
