@@ -28,7 +28,13 @@ VERSION = "1.3.0"
 # traceback to DEBUG_LOG_PATH only happens once set_debug(True) is called —
 # with debug off, behaviour is unchanged from before this facility existed.
 
+# Kept for compatibility with anything referring to the plain path; the actual
+# writes go through debug_log_path(), which is sudo-aware (see user_data_path).
 DEBUG_LOG_PATH = os.path.expanduser("~/.local/share/syswatch/debug.log")
+
+
+def debug_log_path():
+    return user_data_path("debug.log")
 
 _debug_enabled = False
 _error_lock    = threading.Lock()
@@ -60,16 +66,18 @@ def note_error(collector, exc=None):
             return
         _last_logged[collector] = now
     try:
-        d = os.path.dirname(DEBUG_LOG_PATH)
+        path = debug_log_path()
+        d = os.path.dirname(path)
         if d:
             os.makedirs(d, exist_ok=True)
-        with open(DEBUG_LOG_PATH, "a") as f:
+        with open(path, "a") as f:
             ts = _dt.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
             f.write(f"[{ts}] {collector}\n")
             if exc is not None:
                 f.write("".join(
                     traceback.format_exception(type(exc), exc, exc.__traceback__)))
             f.write("\n")
+        chown_to_invoking_user(d, path)
     except Exception:
         pass  # debug logging itself must never be a new source of crashes
 
@@ -87,6 +95,86 @@ def log_uncaught_thread_exception(args):
     escaping its own run() loop is recorded instead of just quietly ending."""
     name = args.thread.name if args.thread is not None else "unknown"
     note_error(f"thread:{name} (uncaught, thread exiting)", args.exc_value)
+
+
+# ── invoking user (sudo-aware paths) ─────────────────────────────────────────
+
+_invoking_home_cache = ()  # () = not yet resolved; (value,) once resolved
+
+
+def invoking_user_home():
+    """Home directory of the human behind `sudo`, or None when that doesn't
+    apply (not root, no SUDO_USER, or the user can't be resolved).
+
+    Under `sudo syswatch`, HOME/`~` point at root's home, so every piece of
+    per-user state — config.toml, metrics.csv, known_devices.json, the alert
+    logs — would silently be a *different* set of files from the ones an
+    unprivileged run uses. Everything that resolves per-user state goes through
+    this so they all agree on whose files they mean; resolved via the passwd
+    database rather than assuming /home/<name>, which is wrong for users with a
+    non-standard home.
+
+    Cached: the answer can't change during the process, and note_error() calls
+    into this often enough that repeating a passwd lookup would be wasteful.
+    """
+    global _invoking_home_cache
+    if _invoking_home_cache:
+        return _invoking_home_cache[0]
+    result = None
+    try:
+        if os.geteuid() == 0:
+            sudo_user = os.environ.get("SUDO_USER")
+            if sudo_user and sudo_user != "root":
+                import pwd
+                result = pwd.getpwnam(sudo_user).pw_dir or None
+    except Exception:
+        result = None
+    _invoking_home_cache = (result,)
+    return result
+
+
+def user_data_path(*parts):
+    """Path under ~/.local/share/syswatch/, sudo-aware.
+
+    Prefers this process's own path when that file already exists, then the
+    invoking user's. When neither exists the invoking user's wins, so state
+    *created* during a `sudo` run lands in the real user's home rather than
+    root's — matching config_path_default(). Callers that write should follow
+    up with chown_to_invoking_user() so the result isn't root-owned.
+    """
+    own = os.path.join(os.path.expanduser("~/.local/share/syswatch"), *parts)
+    if os.path.exists(own):
+        return own
+    home = invoking_user_home()
+    if home:
+        return os.path.join(home, ".local", "share", "syswatch", *parts)
+    return own
+
+
+def chown_to_invoking_user(*paths):
+    """Under `sudo`, hand files/directories written into the invoking user's
+    home back to them, so a sudo run doesn't leave root-owned state the user
+    can no longer update unprivileged. Paths outside that home are left alone.
+    Best-effort throughout: failing to chown never invalidates the write."""
+    home = invoking_user_home()
+    if not home:
+        return
+    try:
+        import pwd
+        pw = pwd.getpwnam(os.environ["SUDO_USER"])
+        root = os.path.realpath(home)
+    except Exception:
+        return
+    for p in paths:
+        if not p:
+            continue
+        try:
+            real = os.path.realpath(p)
+            if real != root and not real.startswith(root + os.sep):
+                continue
+            os.chown(p, pw.pw_uid, pw.pw_gid)
+        except Exception:
+            pass
 
 
 # ── platform identity ────────────────────────────────────────────────────────
@@ -229,9 +317,16 @@ def _read_gpu_temp_nvidia():
         )
         if r.returncode != 0 or not r.stdout.strip():
             return None
-        name, temp_str = [p.strip() for p in r.stdout.strip().split(",", 1)]
-        temp = float(temp_str)
-        return {"vendor": "NVIDIA", "label": name, "temp": temp}
+        # One CSV row per GPU. Splitting the whole output instead of just the
+        # first line meant a second GPU turned the temperature field into
+        # "55\nNVIDIA GeForce RTX 3090, 61", which float() rejected — so every
+        # multi-GPU machine reported no GPU temperature at all and logged a
+        # parse error every refresh. Read the first GPU, like the single-GPU
+        # case always did.
+        first = r.stdout.strip().splitlines()[0]
+        name, _, temp_str = first.rpartition(",")
+        temp = float(temp_str.strip())
+        return {"vendor": "NVIDIA", "label": name.strip(), "temp": temp}
     except Exception as e:
         note_error("_read_gpu_temp_nvidia", e)
         return None
@@ -378,6 +473,14 @@ def _read_storage_temp_psutil():
 
 
 def _read_storage_temp_smartctl(base, kind):
+    # smartmontools is a documented soft dependency. Letting the run() call
+    # below raise FileNotFoundError instead would record a collector error on
+    # every refresh, so a machine that simply doesn't have smartctl installed
+    # sat with the header's degraded ⚠ lit permanently — an absent tool
+    # reported as a failing one. Absent means "no reading", same as _vcg() and
+    # PingSweepThread already treat their own missing binaries.
+    if not shutil.which("smartctl"):
+        return None
     dev = f"/dev/{base}"
     cmds = [["smartctl", "-A", dev, "--json"]]
     if kind == "mmc":

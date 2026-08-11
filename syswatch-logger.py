@@ -60,6 +60,9 @@ def _append_alert(log_dir, filename, msg):
         ts = _dt.now().strftime("%Y-%m-%d %H:%M:%S")
         with open(path, "a") as f:
             f.write(f"{ts} {msg}\n")
+        # No-op unless running under sudo, where a newly created alert log
+        # would otherwise be root-owned inside the user's home.
+        sensors.chown_to_invoking_user(path)
     except Exception as e:
         sensors.note_error("_append_alert", e)
 
@@ -145,9 +148,16 @@ def main():
     retention_days = config["logger"]["retention_days"]
     thresh         = config["thresholds"]
 
-    log_dir  = os.path.expanduser("~/.local/share/syswatch")
-    csv_path = os.path.join(log_dir, "metrics.csv")
+    # Sudo-aware (see sensors.user_data_path). The service normally runs as the
+    # real user, where this is just ~/.local/share/syswatch; it matters when
+    # someone runs the logger by hand under sudo, which would otherwise start a
+    # second metrics.csv under /root that the HISTORY tab never shows.
+    csv_path = sensors.user_data_path("metrics.csv")
+    log_dir  = os.path.dirname(csv_path)
     os.makedirs(log_dir, exist_ok=True)
+    # Once at startup rather than per-sample: this is a long-running daemon and
+    # ownership only needs correcting for files it had to create.
+    sensors.chown_to_invoking_user(log_dir, csv_path)
 
     # Prime cpu_percent so the first non-blocking call has a valid baseline.
     psutil.cpu_percent(interval=None)

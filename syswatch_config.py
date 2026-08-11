@@ -21,8 +21,26 @@ import syswatch_sensors as sensors
 # ── locating the config file ─────────────────────────────────────────────────
 
 def config_path_default():
-    xdg = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
-    return os.path.join(xdg, "syswatch", "config.toml")
+    """Where the config lives when no --config PATH was given.
+
+    Mirrors how the HISTORY tab locates metrics.csv (see
+    sensors.user_data_path): under `sudo syswatch`, `~` is root's home, so a
+    config written by the real user would otherwise be invisible and syswatch
+    would silently run on built-in thresholds. An explicit XDG_CONFIG_HOME
+    always wins; otherwise prefer whichever file actually exists, falling back
+    to the invoking user's location so a config *written* under sudo lands in
+    their home rather than root's.
+    """
+    xdg = os.environ.get("XDG_CONFIG_HOME")
+    if xdg:
+        return os.path.join(xdg, "syswatch", "config.toml")
+    own = os.path.join(os.path.expanduser("~/.config"), "syswatch", "config.toml")
+    if os.path.exists(own):
+        return own
+    home = sensors.invoking_user_home()
+    if home:
+        return os.path.join(home, ".config", "syswatch", "config.toml")
+    return own
 
 
 # ── platform-aware service defaults ──────────────────────────────────────────
@@ -71,7 +89,7 @@ _DEFAULT_THRESH = {
 }
 
 _DEFAULT_NETWORK = {
-    "scan":                          True,
+    "scan":                          "known",
     "subnet":                        "192.168.1.0/24",
     "intruder_alerts":               True,
     "arp_refresh":                   2.0,
@@ -116,6 +134,25 @@ def _v_bool(path, v, errors):
         errors.append(f"{path}: expected true/false, got {v!r}")
         return None
     return v
+
+
+def _v_scan_mode(path, v, errors):
+    # Normalizes to one of "known" / "always" / "never" — the same
+    # vocabulary --scan uses. Accepts real TOML booleans (true/false) and
+    # the strings "known", "true", "false" so an existing `scan = true` or
+    # `scan = false` config keeps working exactly as before.
+    if isinstance(v, bool):
+        return "always" if v else "never"
+    if isinstance(v, str):
+        lv = v.strip().lower()
+        if lv == "known":
+            return "known"
+        if lv == "true":
+            return "always"
+        if lv == "false":
+            return "never"
+    errors.append(f'{path}: expected "known", true, or false, got {v!r}')
+    return None
 
 
 def _v_str_list(path, v, errors):
@@ -189,7 +226,7 @@ _SCHEMA = {
         k: _v_thresh_pair for k in _DEFAULT_THRESH
     },
     "network": {
-        "scan":                         _v_bool,
+        "scan":                         _v_scan_mode,
         "subnet":                       _v_subnet,
         "intruder_alerts":              _v_bool,
         "arp_refresh":                  _v_num(0.1, 3600),
@@ -355,6 +392,41 @@ def _merge_validated(cfg, raw, errors):
                 cfg[section][key] = result
 
 
+def validate_raw(section, key, raw_text):
+    """Validate one hand-typed value for `section.key` using the exact same
+    parser and validator load_config() uses on the config file — the single
+    entry point interactive prompts (install-syswatch.sh) call so there's
+    only one place that knows what's a valid value for a given key.
+
+    raw_text is parsed the same way a config file's value would be (TOML
+    scalars/arrays via the fallback parser above), with two allowances that
+    make sense for a typed reply but not a config file: unquoted bareword
+    strings (e.g. `known` instead of `"known"`), and a bare comma-separated
+    pair for an array value (e.g. `70, 80` instead of `[70, 80]` — typing
+    the enclosing brackets isn't obvious when the prompt already wraps the
+    suggested default in brackets of its own). Returns (value, None) on
+    success or (None, error_message) on failure.
+    """
+    if section not in _SCHEMA or key not in _SCHEMA[section]:
+        return None, f"{section}.{key}: unknown key"
+    text = raw_text.strip()
+    try:
+        parsed = _parse_value(text, 0)
+    except _TomlFallbackError:
+        if "," in text and not (text.startswith("[") and text.endswith("]")):
+            try:
+                parsed = _parse_value(f"[{text}]", 0)
+            except _TomlFallbackError:
+                parsed = text
+        else:
+            parsed = text
+    errors = []
+    value = _SCHEMA[section][key](f"{section}.{key}", parsed, errors)
+    if value is None:
+        return None, "; ".join(errors) if errors else f"{section}.{key}: invalid value"
+    return value, None
+
+
 def load_config(path=None):
     """Load and validate the config file, merged over built-in defaults.
 
@@ -368,6 +440,13 @@ def load_config(path=None):
     used_path = path or config_path_default()
 
     if not os.path.exists(used_path):
+        # A missing file at the *default* path is the normal case (no config
+        # written yet) and stays silent. A file the caller explicitly asked
+        # for is different: a typo, or a relative path resolved against the
+        # wrong cwd, would otherwise run on built-in defaults with no hint
+        # that the requested file was never read.
+        if path is not None:
+            errors.append(f"{used_path}: no such file — using built-in defaults")
         return cfg, errors
 
     try:
@@ -392,10 +471,67 @@ def load_config(path=None):
 
 
 # ── writing an example config ────────────────────────────────────────────────
+#
+# example_config_text() takes an optional `overrides` — a sparse dict shaped
+# like {"thresholds": {"cpu_pct": (80.0, 95.0)}, "network": {...}, ...} —
+# used by install-syswatch.sh to bake in a few interactively-answered values
+# (already validated via validate_raw()) while leaving every other key's
+# comment and formatting exactly as the fully-defaulted example reads. With
+# no overrides (or overrides=None) the output is byte-identical to before.
 
-def example_config_text():
+def _fmt_num_bare(v):
+    # 80.0 -> "80" (matches the bare-int style the hand-written defaults
+    # below use), 85.5 -> "85.5".
+    fv = float(v)
+    return str(int(fv)) if fv.is_integer() else str(fv)
+
+
+def _fmt_thresh(default_pair, override):
+    warn, crit = override if override is not None else default_pair
+    return f"[{_fmt_num_bare(warn)}, {_fmt_num_bare(crit)}]"
+
+
+def _fmt_scan(override):
+    # validate_raw()/_v_scan_mode normalize to "known"/"always"/"never",
+    # but only "known" is itself valid *inside* a config file — "always"/
+    # "never" round-trip as the true/false spelling load_config() accepts.
+    mode = override if override is not None else "known"
+    return {"known": '"known"', "always": "true", "never": "false"}[mode]
+
+
+def _fmt_bool(v):
+    return "true" if v else "false"
+
+
+def example_config_text(overrides=None):
+    overrides = overrides or {}
+    th  = overrides.get("thresholds", {})
+    net = overrides.get("network", {})
+    ui  = overrides.get("ui", {})
+    lg  = overrides.get("logger", {})
+
     services = _default_watched_services()
     services_toml = ", ".join(f'"{s}"' for s in services)
+
+    cpu_pct      = _fmt_thresh(_DEFAULT_THRESH["cpu_pct"],      th.get("cpu_pct"))
+    ram_pct      = _fmt_thresh(_DEFAULT_THRESH["ram_pct"],      th.get("ram_pct"))
+    cpu_temp     = _fmt_thresh(_DEFAULT_THRESH["cpu_temp"],     th.get("cpu_temp"))
+    disk_pct     = _fmt_thresh(_DEFAULT_THRESH["disk_pct"],     th.get("disk_pct"))
+    gpu_temp     = _fmt_thresh(_DEFAULT_THRESH["gpu_temp"],     th.get("gpu_temp"))
+    storage_temp = _fmt_thresh(_DEFAULT_THRESH["storage_temp"], th.get("storage_temp"))
+
+    scan            = _fmt_scan(net.get("scan"))
+    intruder_alerts = _fmt_bool(net.get("intruder_alerts", _DEFAULT_NETWORK["intruder_alerts"]))
+
+    # str(float(...)) always keeps a decimal point (str(float(1)) == "1.0"),
+    # matching the hand-written "1.0" default without truncating precision
+    # on a value like 0.33 the way a fixed-decimal format would.
+    refresh     = str(float(ui.get("refresh", _DEFAULT_UI["refresh"])))
+    default_tab = int(ui.get("default_tab", _DEFAULT_UI["default_tab"]))
+
+    log_interval  = int(lg.get("interval", _DEFAULT_LOGGER["interval"]))
+    log_retention = int(lg.get("retention_days", _DEFAULT_LOGGER["retention_days"]))
+
     return f'''# syswatch configuration
 #
 # Location: $XDG_CONFIG_HOME/syswatch/config.toml (default ~/.config/syswatch/config.toml)
@@ -411,17 +547,25 @@ watch = [{services_toml}]
 
 [thresholds]
 # Each threshold is [warning, critical].
-cpu_pct      = [80, 95]
-ram_pct      = [75, 90]
-cpu_temp     = [70, 80]
-disk_pct     = [85, 95]
-gpu_temp     = [85, 95]
-storage_temp = [65, 75]
+cpu_pct      = {cpu_pct}
+ram_pct      = {ram_pct}
+cpu_temp     = {cpu_temp}
+disk_pct     = {disk_pct}
+gpu_temp     = {gpu_temp}
+storage_temp = {storage_temp}
 
 [network]
-scan             = true                 # active ping sweep in addition to passive ARP reading
+# scan controls the active ping sweep and takes three values:
+#   "known" (default) — sweep only if the current network is already in
+#                        known_devices.json; passive ARP reading everywhere
+#                        else. Press [t] on the NETWORK tab (or run
+#                        --trust-all-devices) to mark a network as known.
+#   true               — always sweep, regardless of whether the network
+#                        is known (the old unconditional behaviour)
+#   false              — never sweep; passive ARP reading only
+scan             = {scan}
 subnet           = "192.168.1.0/24"     # fallback CIDR swept when no local network is auto-detected
-intruder_alerts  = true                 # flag devices never seen on this network as INTRUDER
+intruder_alerts  = {intruder_alerts}                 # flag devices never seen on this network as INTRUDER
 arp_refresh      = 2.0                  # seconds between ARP table reads
 ping_cycle       = 420                  # seconds to sweep every host once
 ping_batch       = 10                   # concurrent pings per batch
@@ -430,8 +574,8 @@ baseline_window  = 60                   # seconds to silently learn devices the 
 known_devices_retention_days = 90       # prune allowlist entries not seen in N days
 
 [ui]
-refresh          = 1.0   # seconds between redraws (minimum enforced: 0.5)
-default_tab      = 1     # 1-based tab to start on
+refresh          = {refresh}   # seconds between redraws (minimum enforced: 0.5)
+default_tab      = {default_tab}     # 1-based tab to start on
 top_n            = 5     # processes shown on the SYSTEM tab
 history          = 60    # samples kept for in-memory sparklines
 alert_ttl        = 30    # seconds a footer alert stays visible
@@ -439,14 +583,15 @@ watchdog_refresh = 10.0  # seconds between service-status checks
 storage_refresh  = 60.0  # seconds between storage/SMART checks
 
 [logger]
-interval       = 120  # seconds between syswatch-logger samples
-retention_days = 30   # days of metrics.csv history kept
+interval       = {log_interval}  # seconds between syswatch-logger samples
+retention_days = {log_retention}   # days of metrics.csv history kept
 '''
 
 
-def write_default_config(path=None, force=False):
-    """Write a fully commented example config. Raises FileExistsError if the
-    file already exists and force is False. Returns the path written."""
+def write_default_config(path=None, force=False, overrides=None):
+    """Write a fully commented example config, with `overrides` (see
+    example_config_text()) baked in where given. Raises FileExistsError if
+    the file already exists and force is False. Returns the path written."""
     path = path or config_path_default()
     if os.path.exists(path) and not force:
         raise FileExistsError(path)
@@ -455,6 +600,10 @@ def write_default_config(path=None, force=False):
         os.makedirs(d, exist_ok=True)
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
-        f.write(example_config_text())
+        f.write(example_config_text(overrides))
     os.replace(tmp, path)
+    # config_path_default() resolves to the invoking user's home under sudo, so
+    # without this `sudo syswatch --write-default-config` would leave a
+    # root-owned config they can't edit unprivileged.
+    sensors.chown_to_invoking_user(d, path)
     return path

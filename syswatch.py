@@ -17,6 +17,7 @@ import math
 import re
 import dataclasses
 import argparse
+import locale
 from datetime import datetime as _dt
 
 
@@ -54,6 +55,42 @@ def _note(collector, exc=None):
     sensors.note_error(collector, exc)
 
 
+def _init_ctype_locale():
+    """Give ncurses a locale that can actually encode the glyphs the TUI is
+    drawn from. Must run before curses initialises.
+
+    Python never calls setlocale() on its own, so the C-level locale stays "C"
+    (ASCII) unless we set it. ncurses converts the wide characters Python hands
+    it back to bytes using that locale, so under e.g. `LC_ALL=C ssh host
+    syswatch` every box-drawing, block and sparkline glyph came out as raw
+    invalid-UTF-8 bytes and the whole display was garbage. (LANG=C alone
+    happened to survive only because PEP 538 coerces it to C.UTF-8; setting
+    LC_ALL suppresses that coercion.)
+
+    Only LC_CTYPE is touched, not LC_ALL — character encoding is the only part
+    that matters here, and taking LC_TIME/LC_NUMERIC as well would quietly
+    change strftime month abbreviations on the HISTORY axis and number
+    formatting elsewhere. If the user's own locale can't represent the glyphs,
+    fall back to a UTF-8 one; if none exists, leave things as they were.
+    """
+    try:
+        locale.setlocale(locale.LC_CTYPE, "")
+    except Exception:
+        pass
+    try:
+        codeset = locale.nl_langinfo(locale.CODESET)
+    except Exception:
+        return
+    if codeset.lower().replace("-", "").replace("_", "") == "utf8":
+        return
+    for candidate in ("C.UTF-8", "C.utf8", "en_US.UTF-8"):
+        try:
+            locale.setlocale(locale.LC_CTYPE, candidate)
+            return
+        except Exception:
+            continue
+
+
 # ── CONFIG ─────────────────────────────────────────────────────────────────────
 # Every user-tunable value below (services, thresholds, network/UI/logger
 # settings) is defined once, in syswatch_config.py's built-in defaults, and
@@ -65,7 +102,7 @@ NUM_CORES     = psutil.cpu_count(logical=True) or 4
 WATCHED_SERVICES = []
 THRESH            = {}
 SCAN_SUBNET       = "192.168.1.0/24"
-SCAN_ENABLED      = True
+SCAN_MODE         = "known"  # "known" | "always" | "never"
 HISTORY           = 60
 REFRESH           = 1.0
 TOP_N             = 5
@@ -79,7 +116,12 @@ ALERT_TTL         = 30
 INTRUDER_ALERTS   = True
 BASELINE_WINDOW   = 60
 KNOWN_DEVICES_RETENTION_DAYS = 90
-KNOWN_DEVICES_PATH = known_devices.default_path()
+# Sudo-aware, exactly like the config and metrics.csv: under `sudo syswatch`,
+# `~` is root's home, so this used to resolve to root's (empty) allowlist —
+# every device on the LAN flagged INTRUDER, and [t] writing somewhere an
+# unprivileged run would never look. The file's format and keying are
+# unchanged; only which directory it's found in.
+KNOWN_DEVICES_PATH = sensors.user_data_path("known_devices.json")
 
 def build_tabs():
     tabs = [
@@ -398,6 +440,7 @@ _state = {
     "services":    [],
     "storage":     None,
     "backup":      None,
+    "network_meta": None,  # {"net_id", "known", "scan_mode"} — see ARPPassiveThread
 }
 _state_lock = threading.Lock()
 _alerts     = collections.deque(maxlen=5)
@@ -405,6 +448,32 @@ _alerts     = collections.deque(maxlen=5)
 
 def push_alert(msg: str):
     _alerts.append((time.monotonic(), f"{_dt.now().strftime('%H:%M:%S')} {msg}"))
+
+
+# Collector threads that have died. None of them ever exit run() on their own
+# while syswatch is up — they loop until their stop event is set — so a thread
+# that isn't alive during normal operation has crashed, and whatever panel it
+# fed is frozen for the rest of the session.
+#
+# This is tracked separately from sensors.has_recent_errors() because that only
+# reports errors from the last 15 seconds: threading.excepthook does record the
+# crash, so the header's ⚠ appeared, but then cleared 15s later and the panel
+# went on quietly showing stale data forever. Permanent breakage needs a
+# permanent signal.
+_dead_threads = set()
+
+
+def scan_dead_threads(threads):
+    """Record any collector thread that has died, alerting once per thread.
+    Call only while syswatch is running, never during shutdown."""
+    for t in threads:
+        if t.is_alive():
+            continue
+        name = type(t).__name__
+        if name not in _dead_threads:
+            _dead_threads.add(name)
+            push_alert(f"{name} died — that panel has stopped updating")
+    return _dead_threads
 
 
 def get_state():
@@ -498,12 +567,16 @@ class SystemThread(threading.Thread):
 
     def _write_temp_alert(self, msg):
         try:
-            log_dir = os.path.expanduser("~/.local/share/syswatch")
+            # Sudo-aware so a `sudo syswatch` run appends to the same alert
+            # history as an unprivileged one instead of starting a second copy
+            # under /root that the user never sees.
+            log_path = sensors.user_data_path("temp_alerts.log")
+            log_dir  = os.path.dirname(log_path)
             os.makedirs(log_dir, exist_ok=True)
-            log_path = os.path.join(log_dir, "temp_alerts.log")
             ts = _dt.now().strftime("%Y-%m-%d %H:%M:%S")
             with open(log_path, "a") as f:
                 f.write(f"{ts} {msg}\n")
+            sensors.chown_to_invoking_user(log_dir, log_path)
         except Exception as e:
             _note("SystemThread._write_temp_alert", e)
 
@@ -560,6 +633,7 @@ class ARPPassiveThread(threading.Thread):
         self._stop_event    = threading.Event()
         self._known         = known_devices.load(KNOWN_DEVICES_PATH)
         self._net_id        = None
+        self._net_known     = False  # was self._net_id already in the allowlist when detected
         self._baseline_until = 0.0
         self._dirty          = False
 
@@ -590,15 +664,47 @@ class ARPPassiveThread(threading.Thread):
         net_id = known_devices.network_identity(nets)
         if net_id != self._net_id:
             self._net_id = net_id
+            # Cached at the moment this network is detected, not re-derived
+            # every cycle: baseline learning below writes newly-seen devices
+            # into self._known within moments of arriving on a brand new
+            # network, which would otherwise flip "known" true almost
+            # immediately regardless of whether the user ever trusted it.
+            # trust_all() is the only thing allowed to flip it mid-session —
+            # see [network] scan = "known" (SCAN_MODE) in main().
+            self._net_known = known_devices.has_network(self._known, net_id)
             # Only a genuinely unseen network gets a silent learning window —
             # a network we already have an allowlist for classifies devices
             # correctly (known vs. not) from the very first cycle.
-            self._baseline_until = now + BASELINE_WINDOW if net_id not in self._known else 0.0
+            self._baseline_until = now + BASELINE_WINDOW if not self._net_known else 0.0
+            self._publish_network_meta()
         return self._net_id
+
+    def current_network_known(self):
+        """Whether the network syswatch is currently on was already in
+        known_devices.json when detected. Drives [network] scan = "known"
+        (PingSweepThread) and the NETWORK tab's passive-only indicator."""
+        return self._net_known
+
+    def _publish_network_meta(self):
+        with _state_lock:
+            _state["network_meta"] = {
+                "net_id":    self._net_id,
+                "known":     self._net_known,
+                "scan_mode": SCAN_MODE,
+            }
 
     def _save(self, now):
         self._known = known_devices.prune(self._known, KNOWN_DEVICES_RETENTION_DAYS, now)
-        known_devices.save(self._known, KNOWN_DEVICES_PATH)
+        if known_devices.save(self._known, KNOWN_DEVICES_PATH):
+            # Written under sudo it would otherwise be root-owned inside the
+            # user's home, which a later unprivileged run couldn't update.
+            sensors.chown_to_invoking_user(
+                os.path.dirname(KNOWN_DEVICES_PATH), KNOWN_DEVICES_PATH)
+        else:
+            # Genuine permanent breakage (unwritable path), not a transient
+            # sensor hiccup — surface it rather than letting [t] look like it
+            # worked while nothing is ever remembered across runs.
+            _note(f"known_devices.save (allowlist not persisted to {KNOWN_DEVICES_PATH})")
         self._dirty = False
 
     def trust_all(self):
@@ -615,7 +721,11 @@ class ARPPassiveThread(threading.Thread):
             for dev in _state["devices"].values():
                 if dev.status == "INTRUDER":
                     dev.status = "Active"
+        # This network is now known, whatever scan mode is in effect — the
+        # explicit trust action is what "known" mode is waiting for.
+        self._net_known = True
         self._save(now)
+        self._publish_network_meta()
 
     def run(self):
         self._net_id = self._refresh_network_identity(time.time())
@@ -677,25 +787,40 @@ class ARPPassiveThread(threading.Thread):
 
 # ── PingSweepThread ────────────────────────────────────────────────────────────
 class PingSweepThread(threading.Thread):
-    def __init__(self, enabled=True):
+    def __init__(self, scan_mode="known", is_network_known=None):
         super().__init__(daemon=True)
         self._stop_event = threading.Event()
-        self._enabled    = enabled
+        self._scan_mode  = scan_mode  # "known" | "always" | "never"
+        # Callable checked live (not just at construction) so a network
+        # switch or a mid-run [t] trust is picked up without restarting —
+        # reuses ARPPassiveThread.current_network_known(), the same
+        # network-identity function known_devices.json is keyed by, rather
+        # than inventing a second notion of "this network" here.
+        self._is_network_known = is_network_known or (lambda: False)
         self._networks = []  # local networks to sweep, from sensors.local_networks()
         # Resolved once at construction, not per-batch: the "nice ping ..." on
         # every batch used to mean a missing `ping` never raised
         # FileNotFoundError (the *wrapper*, "nice", was still found and would
-        # itself exit 127) — so self._enabled was never set False and the
-        # thread spent its whole life spawning ping's that could never work.
+        # itself exit 127) — so self._binary_available was never set False and
+        # the thread spent its whole life spawning ping's that could never work.
         # Checking with shutil.which() up front detects `ping` correctly
         # regardless of whether `nice` happens to be installed, and lets the
         # sweep still run (just without the CPU-niceness) if only `nice` is
         # missing rather than disabling the whole feature for that reason.
         self._ping_path = shutil.which("ping")
         self._nice_path = shutil.which("nice")
-        if self._ping_path is None:
-            self._enabled = False
+        self._binary_available = self._ping_path is not None
+        if not self._binary_available:
             _note("PingSweepThread.__init__ (ping not found)")
+
+    def _should_scan(self):
+        if not self._binary_available:
+            return False
+        if self._scan_mode == "always":
+            return True
+        if self._scan_mode == "never":
+            return False
+        return self._is_network_known()
 
     @staticmethod
     def _detect_prefix():
@@ -770,7 +895,7 @@ class PingSweepThread(threading.Thread):
             except FileNotFoundError as e:
                 # ping/nice existed at shutil.which() time but not now
                 # (uninstalled mid-run) — stop trying rather than spin.
-                self._enabled = False
+                self._binary_available = False
                 _note("PingSweepThread._ping_batch (spawn, binary vanished)", e)
                 return []
             except Exception as e:
@@ -794,11 +919,19 @@ class PingSweepThread(threading.Thread):
                 self._kill_and_reap(p)
         return alive
 
+    # While gated off in "known" mode, re-check this often rather than
+    # waiting out a full PING_CYCLE — so a network switch or a fresh [t]
+    # trust starts sweeping promptly instead of after several minutes.
+    _KNOWN_MODE_POLL = 5.0
+
     def run(self):
         self._networks = self._detect_networks()
         while not self._stop_event.is_set():
-            if not self._enabled:
-                self._stop_event.wait(PING_CYCLE)
+            if not self._should_scan():
+                wait = (self._KNOWN_MODE_POLL
+                        if self._scan_mode == "known" and self._binary_available
+                        else PING_CYCLE)
+                self._stop_event.wait(wait)
                 continue
             try:
                 ips   = self._all_ips()
@@ -806,6 +939,11 @@ class PingSweepThread(threading.Thread):
                 for i in range(0, len(ips), PING_BATCH):
                     if self._stop_event.is_set():
                         return
+                    if not self._should_scan():
+                        # Network changed to an unknown one (or was
+                        # untrusted) mid-sweep — stop rather than finish
+                        # sweeping a network we're no longer supposed to.
+                        break
                     alive = self._ping_batch(ips[i:i + PING_BATCH])
                     now   = time.time()
                     with _state_lock:
@@ -1034,12 +1172,14 @@ class StorageThread(threading.Thread):
 
     def _write_disk_alert(self, msg):
         try:
-            log_dir = os.path.expanduser("~/.local/share/syswatch")
+            # Sudo-aware — see SystemThread._write_temp_alert.
+            log_path = sensors.user_data_path("disk_alerts.log")
+            log_dir  = os.path.dirname(log_path)
             os.makedirs(log_dir, exist_ok=True)
-            log_path = os.path.join(log_dir, "disk_alerts.log")
             ts = _dt.now().strftime("%Y-%m-%d %H:%M:%S")
             with open(log_path, "a") as f:
                 f.write(f"{ts} {msg}\n")
+            sensors.chown_to_invoking_user(log_dir, log_path)
         except Exception as e:
             _note("StorageThread._write_disk_alert", e)
 
@@ -1127,6 +1267,15 @@ class StorageThread(threading.Thread):
     @staticmethod
     def _smart(base, kind):
         result = {"health": None, "power_on_hours": None, "attrs": []}
+        # Absent smartmontools is a soft dependency, not a collector failure —
+        # see the matching guard in sensors._read_storage_temp_smartctl. The
+        # mmc sysfs fallback below still runs, so eMMC health is unaffected.
+        if not shutil.which("smartctl"):
+            if kind == "mmc":
+                sysfs_health = StorageThread._mmc_health_sysfs(base)
+                if sysfs_health is not None:
+                    result["health"] = sysfs_health
+            return result
         dev = f"/dev/{base}"
         smartctl_cmds = [["smartctl", "-a", dev, "--json"]]
         if kind == "mmc":
@@ -1194,6 +1343,16 @@ class StorageThread(threading.Thread):
 
     @staticmethod
     def _dmesg_errors(base):
+        """(device_errors, fs_errors) counted from the kernel ring buffer, or
+        (None, None) when it couldn't be read at all.
+
+        kernel.dmesg_restrict=1 is the default for unprivileged users on
+        Debian/Ubuntu/Pop!_OS, where `dmesg` exits non-zero with an empty
+        stdout. Ignoring the exit status made that indistinguishable from a
+        clean buffer, so the STORAGE tab reported a confident "0 errors" on
+        exactly the machines where it had read nothing — the opposite of what
+        that panel exists to tell you. Unknown is now reported as unknown.
+        """
         dev_errors = 0
         fs_errors  = 0
         dev_pat = re.escape(base) if base else r"mmcblk|mmc\d|nvme\d"
@@ -1201,6 +1360,8 @@ class StorageThread(threading.Thread):
             r = subprocess.run(
                 ["dmesg"], capture_output=True, text=True, timeout=3,
             )
+            if r.returncode != 0:
+                return None, None
             for line in r.stdout.splitlines():
                 if re.search(dev_pat, line, re.I):
                     if re.search(r"error|EIO|timeout|failed|reset", line, re.I):
@@ -1225,8 +1386,11 @@ class StorageThread(threading.Thread):
                 io        = self._io_stats(base)
                 dev_err, fs_err = self._dmesg_errors(base)
                 # SD/eMMC cards without wear-level registers: derive health from
-                # observed errors, same as before.
-                if is_mmc and smart["health"] is None:
+                # observed errors — but only when the error counts are actually
+                # known. With dmesg unreadable both counts are None, which would
+                # otherwise be read as "not zero" and flag a perfectly healthy
+                # card as WARNING; leaving health None renders an honest N/A.
+                if is_mmc and smart["health"] is None and dev_err is not None:
                     smart["health"] = "GOOD" if (dev_err == 0 and fs_err == 0) else "WARNING"
                 fs_root  = self._fs_stats("/")
                 boot     = sensors.boot_mount()
@@ -1400,7 +1564,14 @@ class FullRenderer:
         # thrown recently, independent of whether --debug is on, so a
         # degraded run is visible without having to already know to enable
         # debug logging.
-        degraded = "⚠ " if sensors.has_recent_errors() else ""
+        # A dead collector thread outranks a transient collector error: it never
+        # recovers, so unlike has_recent_errors() this marker never clears.
+        if _dead_threads:
+            degraded = "⚠ DEAD "
+        elif sensors.has_recent_errors():
+            degraded = "⚠ "
+        else:
+            degraded = ""
         right = f"{degraded}{ts}  {date} "
         self._hline(0, 0, " ", W, cp(CP_HDR))
         self._add(0, 1, left, cp(CP_HDR, bold=True))
@@ -1428,7 +1599,7 @@ class FullRenderer:
             self._add(1, x, padded, attr)
             x += len(padded) + 1
 
-    def _render_footer(self, state, tab_id=None):
+    def _render_footer(self, state):
         H, W = self.win.getmaxyx()
         self._hline(H - 1, 0, " ", W, cp(CP_HDR))
         snap = (state or {}).get("system")
@@ -1450,11 +1621,14 @@ class FullRenderer:
                 start = W * 60 // 100
                 self._add(H - 1, start, alert_text[:W - start - 1],
                           cp(CP_CRITICAL, bold=True))
-            elif tab_id == "network":
-                right = "  [t] trust all devices "
-                rpos  = max(left_end + 1, W - len(right))
-                self._add(H - 1, rpos, right[:W - rpos], cp(CP_HDR))
             else:
+                # The NETWORK tab's [t] binding used to be hinted here, but
+                # this branch sits after the alert branch above and was
+                # silently overwritten whenever a footer alert was showing \u2014
+                # including the INTRUDER alert, exactly when the hint matters
+                # most. It's now rendered inside the NETWORK tab body itself
+                # (_render_network), which stays visible regardless of alert
+                # state, so this footer no longer needs a per-tab case.
                 mdl   = ((state or {}).get("model") or "unknown")[:32]
                 right = f"  {mdl} "
                 rpos  = max(left_end + 1, W - len(right))
@@ -1747,12 +1921,73 @@ class FullRenderer:
 
     # ── Tab 2: NETWORK SCANNER ────────────────────────────────────────────────
 
+    @staticmethod
+    def _network_status_variants(passive_only, has_intruder):
+        # Longest-first; _render_network_status picks the longest one that
+        # fits the terminal width, down to a "[t] trust" floor that never
+        # overflows even the narrowest usable terminal.
+        if passive_only:
+            return (
+                [
+                    "PASSIVE-ONLY — unknown network. Press [t] to trust it and enable active scanning.",
+                    "PASSIVE-ONLY — unknown network — [t] trust to enable scanning",
+                    "PASSIVE-ONLY (unknown net) · [t] trust to scan",
+                    "PASSIVE-ONLY · [t] trust to scan",
+                    "[t] trust to scan",
+                    "[t] trust",
+                ],
+                cp(CP_WARN, bold=True),
+            )
+        if has_intruder:
+            return (
+                [
+                    "INTRUDER(S) FLAGGED — press [t] to trust all devices on this network and clear them",
+                    "INTRUDER(S) FLAGGED — [t] trust all devices to clear",
+                    "INTRUDER(S) FLAGGED · [t] trust all devices",
+                    "[t] trust all devices (clears INTRUDER)",
+                    "[t] trust all devices",
+                    "[t] trust",
+                ],
+                cp(CP_CRITICAL, bold=True),
+            )
+        return (
+            [
+                "[t] trust all devices on this network",
+                "[t] trust all devices",
+                "[t] trust",
+            ],
+            cp(CP_MUTED),
+        )
+
+    def _render_network_status(self, y, w, passive_only, has_intruder):
+        # One combined line for both the "why is this tab showing so little"
+        # explanation and the [t] trust binding — folded together rather
+        # than drawn as two separate notices, and reflecting current state:
+        # emphasized (warn) when this network isn't scanned yet in "known"
+        # mode, emphasized (critical) when trusting would clear an
+        # INTRUDER, de-emphasized otherwise since it's just available.
+        variants, attr = self._network_status_variants(passive_only, has_intruder)
+        max_w = max(0, w - 1)
+        text = next((v for v in variants if len(v) <= max_w), variants[-1][:max_w])
+        if text:
+            self._add(y, 0, text, attr)
+
     def _render_network(self, state):
         H, W = self.win.getmaxyx()
         cy = 2
         ch = H - 3
         self._label(cy, 0, "NETWORK SCANNER")
-        devices = state.get("devices") or {}
+        devices      = state.get("devices") or {}
+        net_meta     = state.get("network_meta") or {}
+        scan_mode    = net_meta.get("scan_mode", SCAN_MODE)
+        net_known    = net_meta.get("known", False)
+        has_intruder = any(d.status == "INTRUDER" for d in devices.values())
+        # Only "known" mode ever withholds the active sweep based on
+        # whether the network is recognised — "always"/"never" don't need
+        # this explanation since they don't depend on network identity.
+        passive_only = scan_mode == "known" and not net_known
+        status_row = cy + 1
+        self._render_network_status(status_row, W, passive_only, has_intruder)
         if not devices:
             msg = "SCANNING…  (ARP TABLE EMPTY OR UNAVAILABLE)"
             self._add(cy + ch // 2, max(0, (W - len(msg)) // 2), msg, cp(CP_MUTED))
@@ -1764,7 +1999,7 @@ class FullRenderer:
         # absorbs any extra terminal width instead of leaving the rest of a wide
         # window blank after a fixed 20-column table.
         hn_w = max(20, W - (15 + 2 + 17 + 2 + 2 + 12 + 2 + 10))
-        hdr_row = cy + 1
+        hdr_row = status_row + 1
         self._add(hdr_row, 0,
                   f"{'IP':<15}  {'MAC':<17}  {'HOSTNAME':<{hn_w}}  {'LAST SEEN':<12}  STATUS",
                   cp(CP_PRIMARY, bold=True))
@@ -1983,10 +2218,13 @@ class FullRenderer:
                 h_str, h_c = health + suffix,     cp(CP_CRITICAL, bold=True)
             self._add(row, 0,  "SMART HEALTH: ", cp(CP_SECONDARY))
             self._add(row, 14, h_str,             h_c)
-            dev_err = snap.get("dev_errors", 0)
-            dev_c   = cp(CP_CRITICAL, bold=True) if dev_err > 0 else cp(CP_DIM)
+            # None = the kernel log couldn't be read (dmesg_restrict), which is
+            # not the same as zero — say so rather than implying a clean bill.
+            dev_err = snap.get("dev_errors")
+            dev_str = "N/A" if dev_err is None else str(dev_err)
+            dev_c   = cp(CP_CRITICAL, bold=True) if dev_err else cp(CP_DIM)
             self._add(row, half,      "DEV ERRORS (this boot): ", cp(CP_SECONDARY))
-            self._add(row, half + 24, str(dev_err),               dev_c)
+            self._add(row, half + 24, dev_str,                    dev_c)
             row += 1
         if row < cy + ch:
             temp = snap.get("temp")
@@ -1998,10 +2236,11 @@ class FullRenderer:
                           threshold_cp(temp, "storage_temp"))
             else:
                 self._add(row, 14, "N/A", cp(CP_DIM))
-            fs_err = snap.get("fs_errors", 0)
-            fs_c   = cp(CP_CRITICAL, bold=True) if fs_err > 0 else cp(CP_DIM)
+            fs_err  = snap.get("fs_errors")
+            fs_str  = "N/A" if fs_err is None else str(fs_err)
+            fs_c    = cp(CP_CRITICAL, bold=True) if fs_err else cp(CP_DIM)
             self._add(row, half,      "FS ERRORS  (this boot): ", cp(CP_SECONDARY))
-            self._add(row, half + 24, str(fs_err),                fs_c)
+            self._add(row, half + 24, fs_str,                     fs_c)
             row += 1
         if row < cy + ch:
             poh = snap.get("power_on_hours")
@@ -2253,26 +2492,16 @@ class FullRenderer:
 
     # ── Tab 7: HISTORY ───────────────────────────────────────────────────────
 
-    _HIST_CSV = os.path.expanduser("~/.local/share/syswatch/metrics.csv")
     _HIST_TTL = 10.0
 
     def _hist_csv_path(self):
-        # Normal case: the per-user metrics file under the caller's home.
-        if os.path.exists(self._HIST_CSV):
-            return self._HIST_CSV
-        # When syswatch is launched with sudo, ~ expands to /root and the
-        # logger's data (written as the real user) would be missed. Fall back
-        # to the invoking user's home if that file exists.
-        try:
-            if os.geteuid() == 0:
-                sudo_user = os.environ.get("SUDO_USER")
-                if sudo_user:
-                    alt = f"/home/{sudo_user}/.local/share/syswatch/metrics.csv"
-                    if os.path.exists(alt):
-                        return alt
-        except Exception:
-            pass
-        return self._HIST_CSV
+        # Own path if it exists, else the invoking user's — under `sudo
+        # syswatch`, ~ is root's home and the logger's data (written as the
+        # real user) would be missed. Shared with config_path_default() so
+        # metrics and config always resolve to the same user; the old inline
+        # version assumed /home/<name>, which is wrong for a user whose home
+        # isn't there.
+        return sensors.user_data_path("metrics.csv")
 
     @staticmethod
     def _col(parts, i):
@@ -2592,7 +2821,7 @@ class FullRenderer:
                          if 1 <= active_tab <= len(self.tabs) else None)
         self._render_header()
         self._render_tab_bar(active_tab)
-        self._render_footer(state, tab_id=active_tab_id)
+        self._render_footer(state)
         tab_renderers = {
             "system":  lambda: self._render_system(state),
             "network": lambda: self._render_network(state),
@@ -2639,7 +2868,7 @@ def _curses_main(stdscr, args, cfg_errors=None):
     threads = [
         SystemThread(),
         arp_thread,
-        PingSweepThread(enabled=SCAN_ENABLED),
+        PingSweepThread(scan_mode=SCAN_MODE, is_network_known=arp_thread.current_network_known),
         LogThread(),
         ServiceWatchdogThread(),
         StorageThread(),
@@ -2712,6 +2941,7 @@ def _curses_main(stdscr, args, cfg_errors=None):
 
         now = time.monotonic()
         if now - last_render >= REFRESH:
+            scan_dead_threads(threads)
             state = get_state()
             try:
                 # Nothing between here and curses.wrapper() catches a render
@@ -2768,6 +2998,19 @@ def _print_report(as_json):
     if boot:
         disks[boot] = StorageThread._fs_stats(boot)
 
+    # In "known" mode, whether *this run* would actually sweep depends on
+    # whether the current network is already in known_devices.json — check
+    # it the same way PingSweepThread does, via ARPPassiveThread's
+    # network-identity function, rather than a second notion of "known".
+    network_recognised = None
+    if SCAN_MODE == "known":
+        try:
+            arp_probe = ARPPassiveThread()
+            arp_probe._refresh_network_identity(time.time())
+            network_recognised = arp_probe.current_network_known()
+        except Exception as e:
+            _note("_print_report (scan mode probe)", e)
+
     if as_json:
         report = {
             "generated":     now.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -2780,6 +3023,8 @@ def _print_report(as_json):
             "storage_temp_c": storage_temp,
             "core_volts":    voltage,
             "throttled":     throttled,
+            "scan_mode":     SCAN_MODE,
+            "scan_network_recognised": network_recognised,
             "services":      services,
             "failed_services": failed,
             "disks": {
@@ -2804,6 +3049,17 @@ def _print_report(as_json):
     gpu_suffix = f" ({gpu_info['vendor']})" if gpu_info else ""
     print(f"GPU temp:     {fmt(gpu_temp, ' °C')}{gpu_suffix}")
     print(f"Storage temp: {fmt(storage_temp, ' °C')}")
+    if SCAN_MODE == "known":
+        if network_recognised:
+            scan_line = "known — this network is recognised (sweep active)"
+        else:
+            scan_line = ("known — this network is NOT recognised yet "
+                         "(passive-only; press [t] or run --trust-all-devices)")
+    elif SCAN_MODE == "always":
+        scan_line = "always (active sweep unconditionally)"
+    else:
+        scan_line = "never (passive ARP only)"
+    print(f"Scan mode:    {scan_line}")
     if is_pi:
         print(f"Core voltage: {f'{voltage:.4f} V' if voltage is not None else 'N/A'}")
         if throttled is not None:
@@ -2850,7 +3106,7 @@ def _cli_trust_all_devices():
 
 
 def main():
-    global REFRESH, WATCHED_SERVICES, THRESH, SCAN_SUBNET, SCAN_ENABLED
+    global REFRESH, WATCHED_SERVICES, THRESH, SCAN_SUBNET, SCAN_MODE
     global HISTORY, TOP_N, ARP_REFRESH, WATCHDOG_REFRESH, SDCARD_REFRESH
     global PING_CYCLE, PING_BATCH, INTRUDER_TTL, ALERT_TTL, INTRUDER_ALERTS
     global BASELINE_WINDOW, KNOWN_DEVICES_RETENTION_DAYS
@@ -2870,7 +3126,15 @@ def main():
     )
     parser.add_argument(
         "--no-scan", action="store_true",
-        help="disable the active ping sweep (passive ARP only); overrides config",
+        help="disable the active ping sweep (passive ARP only); same as "
+             "--scan never; overrides config",
+    )
+    parser.add_argument(
+        "--scan", type=str, default=None, choices=["known", "always", "never"],
+        metavar="MODE",
+        help="override [network] scan for this run: known = sweep only on "
+             "networks you've already trusted (default), always = always "
+             "sweep, never = passive ARP only",
     )
     parser.add_argument(
         "--report", action="store_true",
@@ -2926,9 +3190,13 @@ def main():
 
     config, cfg_errors = syswatch_config.load_config(args.config)
 
-    # CLI flags override the config file.
+    # CLI flags override the config file. --scan takes precedence over
+    # --no-scan when both are given (an explicit --scan is the more
+    # specific ask), but either alone overrides the config's [network] scan.
     if args.no_scan:
-        config["network"]["scan"] = False
+        config["network"]["scan"] = "never"
+    if args.scan is not None:
+        config["network"]["scan"] = args.scan
     if args.refresh is not None:
         config["ui"]["refresh"] = args.refresh
     if args.tab is not None:
@@ -2937,7 +3205,7 @@ def main():
     WATCHED_SERVICES = config["services"]["watch"]
     THRESH           = config["thresholds"]
     SCAN_SUBNET       = config["network"]["subnet"]
-    SCAN_ENABLED      = config["network"]["scan"]
+    SCAN_MODE         = config["network"]["scan"]
     INTRUDER_ALERTS   = config["network"]["intruder_alerts"]
     ARP_REFRESH       = config["network"]["arp_refresh"]
     PING_CYCLE        = config["network"]["ping_cycle"]
@@ -2965,6 +3233,7 @@ def main():
         return
 
     args.tab = config["ui"]["default_tab"]
+    _init_ctype_locale()  # must precede curses init — see the function's docstring
     try:
         curses.wrapper(lambda stdscr: _curses_main(stdscr, args, cfg_errors))
     except KeyboardInterrupt:
