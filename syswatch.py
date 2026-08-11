@@ -8,6 +8,7 @@ import subprocess
 import collections
 import signal
 import socket
+import shutil
 import ipaddress
 import threading
 import curses
@@ -38,39 +39,47 @@ import asciichartpy
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import syswatch_sensors as sensors
+import syswatch_config
+import syswatch_known_devices as known_devices
+
+# A thread whose run() loop somehow lets an exception escape its own
+# try/except would otherwise just die silently — no crash, no signal, the
+# numbers it was updating simply stop moving. This makes that visible the
+# same way every other collector failure is: recorded via note_error(), so
+# it shows up in the degraded indicator and (with --debug) debug.log.
+threading.excepthook = sensors.log_uncaught_thread_exception
+
+
+def _note(collector, exc=None):
+    sensors.note_error(collector, exc)
 
 
 # ── CONFIG ─────────────────────────────────────────────────────────────────────
-WATCHED_SERVICES = [
-    "ssh", "networking", "cron", "bluetooth", "avahi-daemon", "triggerhappy",
-]
-SCAN_SUBNET = "192.168"   # last-resort fallback: first two octets swept
-                          # (.0.1–.1.254) when no usable local network can be
-                          # detected via sensors.local_networks() or the
-                          # UDP-socket trick
+# Every user-tunable value below (services, thresholds, network/UI/logger
+# settings) is defined once, in syswatch_config.py's built-in defaults, and
+# loaded from $XDG_CONFIG_HOME/syswatch/config.toml (see --write-default-config).
+# The globals here are just placeholders — main() overwrites all of them from
+# the merged CLI/config/defaults result before any thread or report code runs.
+NUM_CORES     = psutil.cpu_count(logical=True) or 4
 
-# ── tunables ───────────────────────────────────────────────────────────────────
-HISTORY        = 60
-REFRESH        = 1.0
-TOP_N          = 5
-NUM_CORES      = psutil.cpu_count(logical=True) or 4
-ARP_REFRESH      = 2.0
-WATCHDOG_REFRESH = 10.0
-SDCARD_REFRESH   = 60.0
-PING_CYCLE       = 420
-PING_BATCH     = 10
-INTRUDER_TTL   = 600
-ALERT_TTL      = 30
-PROCESS_START  = time.time()
-
-THRESH = {
-    "cpu_pct":      (80, 95),
-    "ram_pct":      (75, 90),
-    "cpu_temp":     (70, 80),
-    "disk_pct":     (85, 95),
-    "gpu_temp":     (85, 95),
-    "storage_temp": (65, 75),
-}
+WATCHED_SERVICES = []
+THRESH            = {}
+SCAN_SUBNET       = "192.168.1.0/24"
+SCAN_ENABLED      = True
+HISTORY           = 60
+REFRESH           = 1.0
+TOP_N             = 5
+ARP_REFRESH       = 2.0
+WATCHDOG_REFRESH  = 10.0
+SDCARD_REFRESH    = 60.0
+PING_CYCLE        = 420
+PING_BATCH        = 10
+INTRUDER_TTL      = 600
+ALERT_TTL         = 30
+INTRUDER_ALERTS   = True
+BASELINE_WINDOW   = 60
+KNOWN_DEVICES_RETENTION_DAYS = 90
+KNOWN_DEVICES_PATH = known_devices.default_path()
 
 def build_tabs():
     tabs = [
@@ -163,10 +172,20 @@ def sparkline(history, width):
     data = list(history)
     if not data or width <= 0:
         return " " * width
-    hi = max(data) or 1
+    # max(data) can be <= 0 (e.g. a counter reset briefly drives every value
+    # negative), which would otherwise turn `hi` negative and make
+    # int(v / hi * 8) produce a negative index — SPARK_CHARS[-50] either wraps
+    # to an unrelated glyph or raises IndexError outright, crashing the
+    # render. Floor hi at a small positive value and clamp each value's
+    # domain to [0, hi] so the index math can never leave [0, 8].
+    hi = max(data)
+    hi = hi if hi > 0 else 1
     data = data[-width:]
-    chars = "".join(SPARK_CHARS[min(8, int(v / hi * 8))] for v in data)
-    return chars.ljust(width)
+    chars = []
+    for v in data:
+        idx = int(max(0.0, v) / hi * 8)
+        chars.append(SPARK_CHARS[max(0, min(8, idx))])
+    return "".join(chars).ljust(width)
 
 
 # ── Metrics ────────────────────────────────────────────────────────────────────
@@ -189,13 +208,16 @@ class Metrics:
 
     @staticmethod
     def _vcg(arg):
+        if not shutil.which("vcgencmd"):
+            return None
         try:
             r = subprocess.run(
                 ["vcgencmd"] + arg.split(),
                 capture_output=True, text=True, timeout=0.5,
             )
             return r.stdout.strip() if r.returncode == 0 else None
-        except Exception:
+        except Exception as e:
+            _note(f"Metrics._vcg({arg})", e)
             return None
 
     def _soc_temp(self):
@@ -206,7 +228,7 @@ class Metrics:
             raw = self._vcg("measure_temp pmic")
             if raw and "temp=" in raw:
                 try: return float(raw.split("=")[1].strip("'C "))
-                except Exception: pass
+                except Exception as e: _note("Metrics._gpu_temp (parse)", e)
             return None
         gpu = sensors.gpu_temp()
         return gpu["temp"] if gpu else None
@@ -215,18 +237,19 @@ class Metrics:
         raw = self._vcg("measure_volts core")
         if raw and raw.startswith("volt="):
             try: return float(raw[5:].rstrip("V"))
-            except Exception: pass
+            except Exception as e: _note("Metrics._voltage (parse)", e)
         return None
 
     def _cpu_freq(self):
         raw = self._vcg("measure_clock arm")
         if raw and "=" in raw:
             try: return int(raw.split("=")[-1]) // 1_000_000
-            except Exception: pass
+            except Exception as e: _note("Metrics._cpu_freq (vcgencmd parse)", e)
         try:
             with open("/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq") as f:
                 return int(f.read().strip()) // 1000
-        except Exception:
+        except Exception as e:
+            _note("Metrics._cpu_freq (sysfs fallback)", e)
             return None
 
     def _throttled(self):
@@ -235,7 +258,8 @@ class Metrics:
             return None
         try:
             val = int(raw.split("=")[-1], 16)
-        except Exception:
+        except Exception as e:
+            _note("Metrics._throttled (parse)", e)
             return None
         return {
             "uv_now":     bool(val & (1 << 0)),
@@ -275,8 +299,8 @@ class Metrics:
                             "signal":  float(parts[3].rstrip(".")),
                             "quality": float(parts[2].rstrip(".")),
                         }
-        except Exception:
-            pass
+        except Exception as e:
+            _note("Metrics._wifi_signal", e)
         return None
 
     def _top_procs(self):
@@ -297,7 +321,11 @@ class Metrics:
         s["cores"] = cores
         for i, p in enumerate(cores[:NUM_CORES]):
             self.core_hist[i].append(p)
-        avg = sum(cores) / len(cores)
+        # psutil.cpu_percent(percpu=True) should never return an empty list on
+        # a real system, but if it ever did, dividing by len(cores) would
+        # raise ZeroDivisionError and (per the outer try/except in
+        # SystemThread.run()) silently drop the whole cycle's update.
+        avg = sum(cores) / len(cores) if cores else 0.0
         self.hist["cpu"].append(avg); s["cpu_avg"] = avg
 
         mem  = psutil.virtual_memory()
@@ -310,7 +338,8 @@ class Metrics:
 
         try:
             batt = psutil.sensors_battery()
-        except Exception:
+        except Exception as e:
+            _note("Metrics.collect (psutil.sensors_battery)", e)
             batt = None
         s["battery_pct"] = batt.percent if batt is not None else None
 
@@ -385,9 +414,20 @@ def get_state():
     # can crash with "dictionary changed size during iteration" or "deque
     # mutated during iteration". Snapshot each of them into fresh containers
     # here, while still holding the lock those threads mutate under.
+    #
+    # The "devices" dict itself gets a fresh dict(...), but that only copies
+    # the mac->DeviceInfo mapping — the DeviceInfo *objects* it points to are
+    # the very same instances ARPPassiveThread/PingSweepThread keep mutating
+    # (dev.ip = ..., dev.last_seen = ..., dev.status = ...) after this
+    # function returns. A renderer reading dev.ip, then dev.status, then
+    # dev.last_seen as separate statements outside the lock could see a torn
+    # mix of before/after values if a mutation lands between those reads.
+    # dataclasses.replace() makes an independent copy of each record while
+    # still holding the lock, so the snapshot is a true point-in-time view.
     with _state_lock:
         snap = dict(_state)
-        snap["devices"]   = dict(_state["devices"])
+        snap["devices"]   = {mac: dataclasses.replace(dev)
+                              for mac, dev in _state["devices"].items()}
         snap["logs"]      = list(_state["logs"])
         snap["log_errs"]  = list(_state["log_errs"])
         hist = _state.get("system_hist")
@@ -407,12 +447,36 @@ class DeviceInfo:
     status:     str
 
 
+_HOSTNAME_CACHE_TTL = 3600.0  # seconds
+_hostname_cache = {}  # ip -> (monotonic_ts, hostname)
+
+
 def _resolve_hostname(ip: str) -> str:
+    # Only ever called from ARPPassiveThread's single-threaded loop (and the
+    # one-shot --trust-all-devices CLI path, which runs before any other
+    # thread starts), so this plain dict cache needs no lock.
+    cached = _hostname_cache.get(ip)
+    if cached is not None and time.monotonic() - cached[0] < _HOSTNAME_CACHE_TTL:
+        return cached[1]
+    # socket.getnameinfo() has no per-call timeout parameter; on a LAN with
+    # no reverse DNS this can block for many seconds per lookup, and since
+    # ARPPassiveThread resolves every newly-seen MAC before acquiring the
+    # state lock again, that stalls the whole thread (and delays its next
+    # ARP_REFRESH cycle) for as long as the resolver takes. Bound it with the
+    # socket module's global default timeout, the only mechanism getnameinfo
+    # respects — safe here since this is the sole call site that ever sets it.
+    old_timeout = socket.getdefaulttimeout()
     try:
+        socket.setdefaulttimeout(1.5)
         name = socket.getnameinfo((ip, 0), 0)[0]
-        return name if name != ip else ip
-    except Exception:
-        return ip
+        result = name if name != ip else ip
+    except Exception as e:
+        _note("_resolve_hostname", e)
+        result = ip
+    finally:
+        socket.setdefaulttimeout(old_timeout)
+    _hostname_cache[ip] = (time.monotonic(), result)
+    return result
 
 
 def _device_status(dev: DeviceInfo) -> str:
@@ -440,8 +504,8 @@ class SystemThread(threading.Thread):
             ts = _dt.now().strftime("%Y-%m-%d %H:%M:%S")
             with open(log_path, "a") as f:
                 f.write(f"{ts} {msg}\n")
-        except Exception:
-            pass
+        except Exception as e:
+            _note("SystemThread._write_temp_alert", e)
 
     def _check_temp_alert(self, snap):
         ct = snap.get("cpu_temp")
@@ -472,8 +536,8 @@ class SystemThread(threading.Thread):
                     _state["system"]      = snap
                     _state["system_hist"] = self._metrics.hist
                     _state["model"]       = self._metrics.model
-            except Exception:
-                pass
+            except Exception as e:
+                _note("SystemThread.run", e)
             self._stop_event.wait(REFRESH)
 
     def stop(self):
@@ -482,9 +546,22 @@ class SystemThread(threading.Thread):
 
 # ── ARPPassiveThread ───────────────────────────────────────────────────────────
 class ARPPassiveThread(threading.Thread):
+    """Reads /proc/net/arp and classifies discovered devices as Active/Recent/
+    Idle/INTRUDER. A device is INTRUDER only if its MAC has never been seen
+    on the *current* network (tracked via a persistent per-network allowlist
+    at KNOWN_DEVICES_PATH — see syswatch_known_devices.py), so roaming to a
+    new network doesn't carry over "known" status from a previous one. The
+    first time a given network is seen, everything discovered within
+    BASELINE_WINDOW seconds is learned silently instead of alerted on.
+    """
+
     def __init__(self):
         super().__init__(daemon=True)
-        self._stop_event = threading.Event()
+        self._stop_event    = threading.Event()
+        self._known         = known_devices.load(KNOWN_DEVICES_PATH)
+        self._net_id        = None
+        self._baseline_until = 0.0
+        self._dirty          = False
 
     def _parse_arp_table(self):
         result = {}
@@ -498,14 +575,54 @@ class ARPPassiveThread(threading.Thread):
                     if flags == "0x0" or mac == "00:00:00:00:00:00":
                         continue
                     result[mac] = {"ip": ip, "iface": iface}
-        except OSError:
-            pass
+        except OSError as e:
+            # /proc/net/arp should basically always be readable on Linux, so
+            # unlike a genuinely absent sensor, this is worth surfacing.
+            _note("ARPPassiveThread._parse_arp_table", e)
         return result
 
+    def _refresh_network_identity(self, now):
+        try:
+            nets = sensors.local_networks()
+        except Exception as e:
+            _note("ARPPassiveThread._refresh_network_identity", e)
+            nets = []
+        net_id = known_devices.network_identity(nets)
+        if net_id != self._net_id:
+            self._net_id = net_id
+            # Only a genuinely unseen network gets a silent learning window —
+            # a network we already have an allowlist for classifies devices
+            # correctly (known vs. not) from the very first cycle.
+            self._baseline_until = now + BASELINE_WINDOW if net_id not in self._known else 0.0
+        return self._net_id
+
+    def _save(self, now):
+        self._known = known_devices.prune(self._known, KNOWN_DEVICES_RETENTION_DAYS, now)
+        known_devices.save(self._known, KNOWN_DEVICES_PATH)
+        self._dirty = False
+
+    def trust_all(self):
+        """Mark every device currently listed on the NETWORK tab as known on
+        the current network, and clear any INTRUDER flags. Called from the
+        TUI key binding and (via a fresh instance) --trust-all-devices."""
+        now    = time.time()
+        net_id = self._net_id or self._refresh_network_identity(now)
+        with _state_lock:
+            snapshot = list(_state["devices"].items())
+        for mac, dev in snapshot:
+            known_devices.remember(self._known, net_id, mac, dev.hostname, now)
+        with _state_lock:
+            for dev in _state["devices"].values():
+                if dev.status == "INTRUDER":
+                    dev.status = "Active"
+        self._save(now)
+
     def run(self):
+        self._net_id = self._refresh_network_identity(time.time())
         while not self._stop_event.is_set():
             try:
                 now    = time.time()
+                net_id = self._refresh_network_identity(now)
                 parsed = self._parse_arp_table()
                 # Phase 1: under the lock, find which MACs are new. We hold the
                 # lock only briefly here so readers (e.g. the render loop) never
@@ -522,17 +639,22 @@ class ARPPassiveThread(threading.Thread):
                 with _state_lock:
                     devices = _state["devices"]
                     for mac, info in parsed.items():
+                        hostname = hostnames.get(mac, info["ip"])
                         if mac not in devices:
-                            # Still new after the gap — insert it.
-                            is_intruder = (now - PROCESS_START) > 30
-                            status      = "INTRUDER" if is_intruder else "Active"
+                            # Still new after the gap — classify it.
+                            known    = known_devices.is_known(self._known, net_id, mac)
+                            baseline = now < self._baseline_until
+                            if known or baseline or not INTRUDER_ALERTS:
+                                status = "Active"
+                                known_devices.remember(self._known, net_id, mac, hostname, now)
+                                self._dirty = True
+                            else:
+                                status = "INTRUDER"
+                                push_alert(f"INTRUDER: {mac} at {info['ip']}")
                             devices[mac] = DeviceInfo(
-                                ip=info["ip"], mac=mac,
-                                hostname=hostnames.get(mac, info["ip"]),
+                                ip=info["ip"], mac=mac, hostname=hostname,
                                 first_seen=now, last_seen=now, status=status,
                             )
-                            if is_intruder:
-                                push_alert(f"INTRUDER: {mac} at {info['ip']}")
                         else:
                             # Either pre-existing, or it raced in between the two
                             # lock acquisitions — just update it.
@@ -540,8 +662,13 @@ class ARPPassiveThread(threading.Thread):
                             dev.ip        = info["ip"]
                             dev.last_seen = now
                             dev.status    = _device_status(dev)
-            except Exception:
-                pass
+                            if known_devices.is_known(self._known, net_id, mac):
+                                known_devices.remember(self._known, net_id, mac, hostname, now)
+                                self._dirty = True
+                if self._dirty:
+                    self._save(now)
+            except Exception as e:
+                _note("ARPPassiveThread.run", e)
             self._stop_event.wait(ARP_REFRESH)
 
     def stop(self):
@@ -555,6 +682,20 @@ class PingSweepThread(threading.Thread):
         self._stop_event = threading.Event()
         self._enabled    = enabled
         self._networks = []  # local networks to sweep, from sensors.local_networks()
+        # Resolved once at construction, not per-batch: the "nice ping ..." on
+        # every batch used to mean a missing `ping` never raised
+        # FileNotFoundError (the *wrapper*, "nice", was still found and would
+        # itself exit 127) — so self._enabled was never set False and the
+        # thread spent its whole life spawning ping's that could never work.
+        # Checking with shutil.which() up front detects `ping` correctly
+        # regardless of whether `nice` happens to be installed, and lets the
+        # sweep still run (just without the CPU-niceness) if only `nice` is
+        # missing rather than disabling the whole feature for that reason.
+        self._ping_path = shutil.which("ping")
+        self._nice_path = shutil.which("nice")
+        if self._ping_path is None:
+            self._enabled = False
+            _note("PingSweepThread.__init__ (ping not found)")
 
     @staticmethod
     def _detect_prefix():
@@ -572,8 +713,8 @@ class PingSweepThread(threading.Thread):
             octets = ip.split(".")
             if len(octets) == 4:
                 return ".".join(octets[:3])
-        except Exception:
-            pass
+        except Exception as e:
+            _note("PingSweepThread._detect_prefix", e)
         return None
 
     def _detect_networks(self):
@@ -584,46 +725,73 @@ class PingSweepThread(threading.Thread):
         if prefix:
             try:
                 return [ipaddress.IPv4Network(f"{prefix}.0/24")]
-            except Exception:
-                pass
+            except Exception as e:
+                _note("PingSweepThread._detect_networks", e)
         return []
 
     def _all_ips(self):
         # Sweep every detected local network (e.g. 192.168.178.0/24). If none
-        # were detected, fall back to the SCAN_SUBNET constant's two /24s.
+        # were detected, fall back to the configured SCAN_SUBNET CIDR.
         if self._networks:
             return [str(h) for net in self._networks for h in net.hosts()]
-        parts = SCAN_SUBNET.split(".")
-        a, b  = parts[0], parts[1]
-        ips   = []
-        for c in range(0, 2):
-            for d in range(1, 255):
-                ips.append(f"{a}.{b}.{c}.{d}")
-        return ips
+        try:
+            net = ipaddress.IPv4Network(SCAN_SUBNET, strict=False)
+            return [str(h) for h in net.hosts()]
+        except Exception as e:
+            _note("PingSweepThread._all_ips", e)
+            return []
+
+    def _kill_and_reap(self, p, timeout=1):
+        # p.kill() alone leaves a zombie until something waits on it — every
+        # caller of this must always follow up with wait(), never just kill().
+        try:
+            p.kill()
+        except Exception:
+            pass
+        try:
+            p.wait(timeout=timeout)
+        except Exception:
+            pass
 
     def _ping_batch(self, ips):
         procs = {}
         for ip in ips:
+            if self._stop_event.is_set():
+                break
+            cmd = ([self._nice_path, "-n", "19", self._ping_path]
+                   if self._nice_path else [self._ping_path])
             try:
                 p = subprocess.Popen(
-                    ["nice", "-n", "19", "ping", "-c1", "-W1", "-q", ip],
+                    cmd + ["-c1", "-W1", "-q", ip],
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                 )
                 procs[ip] = p
-            except FileNotFoundError:
+            except FileNotFoundError as e:
+                # ping/nice existed at shutil.which() time but not now
+                # (uninstalled mid-run) — stop trying rather than spin.
                 self._enabled = False
+                _note("PingSweepThread._ping_batch (spawn, binary vanished)", e)
                 return []
-            except Exception:
-                pass
+            except Exception as e:
+                _note("PingSweepThread._ping_batch (spawn)", e)
         alive = []
         for ip, p in procs.items():
+            if self._stop_event.is_set():
+                # Shutting down: don't sit out the full per-process timeout
+                # for every straggler still in flight, and never leave one
+                # killed-but-unreaped (a zombie) behind.
+                self._kill_and_reap(p)
+                continue
             try:
                 p.wait(timeout=2)
                 if p.returncode == 0:
                     alive.append(ip)
             except subprocess.TimeoutExpired:
-                p.kill()
+                self._kill_and_reap(p)
+            except Exception as e:
+                _note("PingSweepThread._ping_batch (wait)", e)
+                self._kill_and_reap(p)
         return alive
 
     def run(self):
@@ -647,7 +815,8 @@ class PingSweepThread(threading.Thread):
                                     dev.last_seen = now
                                     dev.status    = _device_status(dev)
                     self._stop_event.wait(delay)
-            except Exception:
+            except Exception as e:
+                _note("PingSweepThread.run", e)
                 self._stop_event.wait(PING_CYCLE)
 
     def stop(self):
@@ -660,6 +829,12 @@ class LogThread(threading.Thread):
         super().__init__(daemon=True)
         self._stop_event = threading.Event()
         self._proc = None
+        # Mirrors ServiceWatchdogThread._available: if journalctl genuinely
+        # isn't installed, FileNotFoundError is unambiguous (nothing here
+        # wraps it in another binary the way the old ping/nice pairing did),
+        # but without this flag run() would still retry launching it every
+        # 5s forever with zero chance of success.
+        self._available = True
 
     def _launch(self):
         try:
@@ -668,8 +843,13 @@ class LogThread(threading.Thread):
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
             )
-        except FileNotFoundError:
+        except FileNotFoundError as e:
             self._proc = None
+            self._available = False
+            _note("LogThread._launch (journalctl not found)", e)
+        except Exception as e:
+            self._proc = None
+            _note("LogThread._launch", e)
 
     def _parse_line(self, raw):
         try:
@@ -691,31 +871,57 @@ class LogThread(threading.Thread):
                 "ts":       ts,
                 "ts_str":   _dt.fromtimestamp(ts).strftime("%H:%M:%S"),
             }
-        except Exception:
+        except Exception as e:
+            _note("LogThread._parse_line", e)
             return None
 
     def _reap(self):
         # Terminate and reap the journalctl child so it doesn't linger as a
         # zombie when its stream ends or errors out. Always clears self._proc.
-        if self._proc is not None:
+        proc = self._proc
+        self._proc = None
+        if proc is None:
+            return
+        try:
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=1)
+                except subprocess.TimeoutExpired:
+                    # terminate() (SIGTERM) can be ignored; escalate rather
+                    # than leaving an unreaped zombie behind.
+                    proc.kill()
+                    proc.wait(timeout=1)
+            else:
+                proc.wait(timeout=1)
+        except Exception as e:
+            _note("LogThread._reap", e)
+        finally:
+            # subprocess.run()'s pipes are closed for us automatically, but a
+            # long-lived Popen like this one leaves its stdout pipe fd open
+            # until something closes it or the object is garbage collected —
+            # not a leak in practice (refcounting reclaims it promptly) but
+            # not guaranteed, and closing it explicitly costs nothing.
             try:
-                if self._proc.poll() is None:
-                    self._proc.terminate()
-                self._proc.wait(timeout=1)
+                if proc.stdout is not None:
+                    proc.stdout.close()
             except Exception:
                 pass
-        self._proc = None
 
     def run(self):
         self._launch()
         while not self._stop_event.is_set():
+            if not self._available:
+                self._stop_event.wait(5.0)
+                continue
             if self._proc is None:
                 self._stop_event.wait(5.0)
                 self._launch()
                 continue
             try:
                 line = self._proc.stdout.readline()
-            except Exception:
+            except Exception as e:
+                _note("LogThread.run (readline)", e)
                 self._reap()
                 continue
             if line == b"":
@@ -734,9 +940,18 @@ class LogThread(threading.Thread):
 
     def stop(self):
         self._stop_event.set()
-        if self._proc:
+        # Capture into a local once: self._proc is mutated by this thread's
+        # own run()/_reap() concurrently, and re-reading self._proc a second
+        # time between the truthiness check and .terminate() could see it
+        # already reset to None by a _reap() that ran in between, turning
+        # this into an AttributeError that the broad except then silently
+        # swallows — leaving the *actual* current process un-terminated and
+        # this thread blocked in readline() until journalctl next emits a
+        # line, well past the shutdown join() timeout.
+        proc = self._proc
+        if proc is not None:
             try:
-                self._proc.terminate()
+                proc.terminate()
             except Exception:
                 pass
 
@@ -764,10 +979,12 @@ class ServiceWatchdogThread(threading.Thread):
                     k, _, v = line.partition("=")
                     props[k.strip()] = v.strip()
             return props
-        except FileNotFoundError:
+        except FileNotFoundError as e:
             self._available = False
+            _note("ServiceWatchdogThread._query (systemctl not found)", e)
             return None
-        except Exception:
+        except Exception as e:
+            _note("ServiceWatchdogThread._query", e)
             return {"unit": unit, "ActiveState": "unknown"}
 
     def run(self):
@@ -780,6 +997,12 @@ class ServiceWatchdogThread(threading.Thread):
             try:
                 results = []
                 for unit in WATCHED_SERVICES:
+                    # Each _query() call blocks up to its own 2s timeout;
+                    # bailing out here as soon as shutdown is requested keeps
+                    # a watchlist of several units from adding several more
+                    # seconds on top of whichever call is already in flight.
+                    if self._stop_event.is_set():
+                        break
                     props = self._query(unit)
                     if props is None:
                         break
@@ -792,8 +1015,8 @@ class ServiceWatchdogThread(threading.Thread):
                 if self._available:
                     with _state_lock:
                         _state["services"] = results
-            except Exception:
-                pass
+            except Exception as e:
+                _note("ServiceWatchdogThread.run", e)
             self._stop_event.wait(WATCHDOG_REFRESH)
 
     def stop(self):
@@ -817,8 +1040,8 @@ class StorageThread(threading.Thread):
             ts = _dt.now().strftime("%Y-%m-%d %H:%M:%S")
             with open(log_path, "a") as f:
                 f.write(f"{ts} {msg}\n")
-        except Exception:
-            pass
+        except Exception as e:
+            _note("StorageThread._write_disk_alert", e)
 
     def _check_disk_alert(self, mount_key, mount_label, fs):
         # Must never raise: run()'s bare try/except would otherwise drop the
@@ -839,8 +1062,8 @@ class StorageThread(threading.Thread):
                     f"{label} disk={mount_label} {pct:.1f}% (threshold={threshold}%)"
                 )
             self._disk_alert_level[mount_key] = level
-        except Exception:
-            pass
+        except Exception as e:
+            _note("StorageThread._check_disk_alert", e)
 
     @staticmethod
     def _fs_stats(path):
@@ -851,7 +1074,8 @@ class StorageThread(threading.Thread):
             used  = total - free
             pct   = used / total * 100 if total else 0.0
             return {"total": total, "used": used, "free": free, "pct": pct}
-        except Exception:
+        except Exception as e:
+            _note("StorageThread._fs_stats", e)
             return None
 
     @staticmethod
@@ -867,7 +1091,8 @@ class StorageThread(threading.Thread):
                 "writes":         int(fields[4]),
                 "write_sectors":  int(fields[6]),
             }
-        except Exception:
+        except Exception as e:
+            _note("StorageThread._io_stats", e)
             return None
 
     @staticmethod
@@ -948,10 +1173,10 @@ class StorageThread(threading.Thread):
                             result["health"] = "PASSED" if "PASSED" in line else "FAILED"
                     if result["health"] is not None:
                         return result
-                except Exception:
-                    pass
-            except Exception:
-                pass
+                except Exception as e:
+                    _note("StorageThread._smart (plain-text fallback)", e)
+            except Exception as e:
+                _note("StorageThread._smart", e)
         if kind == "mmc":
             sysfs_health = StorageThread._mmc_health_sysfs(base)
             if sysfs_health is not None:
@@ -963,7 +1188,8 @@ class StorageThread(threading.Thread):
         try:
             with open(f"/sys/block/{base}/device/type") as f:
                 return f.read().strip()
-        except Exception:
+        except Exception as e:
+            _note("StorageThread._card_type", e)
             return None
 
     @staticmethod
@@ -982,8 +1208,8 @@ class StorageThread(threading.Thread):
                 elif re.search(r"ext4|xfs|btrfs", line, re.I):
                     if re.search(r"error|corrupt|journal.*abort", line, re.I):
                         fs_errors += 1
-        except Exception:
-            pass
+        except Exception as e:
+            _note("StorageThread._dmesg_errors", e)
         return dev_errors, fs_errors
 
     def run(self):
@@ -1029,8 +1255,8 @@ class StorageThread(threading.Thread):
                 self._check_disk_alert("fs_root", "/", fs_root)
                 if boot:
                     self._check_disk_alert(boot, boot, fs_boot)
-            except Exception:
-                pass
+            except Exception as e:
+                _note("StorageThread.run", e)
             self._stop_event.wait(SDCARD_REFRESH)
 
     def stop(self):
@@ -1058,7 +1284,11 @@ class BackupStatusThread(threading.Thread):
                     data = None
                 with _state_lock:
                     _state["backup"] = data
-            except Exception:
+            except Exception as e:
+                # FileNotFoundError (no project-backup installed) is the
+                # overwhelmingly common case here and not a bug — dedup in
+                # note_error() keeps it from spamming debug.log every cycle.
+                _note("BackupStatusThread.run", e)
                 with _state_lock:
                     _state["backup"] = None
             self._stop_event.wait(15)
@@ -1108,6 +1338,15 @@ class FullRenderer:
     def _bar(self, y, x, pct, width, key=None):
         if width < 3:
             return
+        # threshold_cp() right below already treats a None value as "no
+        # data" and falls back gracefully; _bar() itself didn't, so any
+        # caller passing through an unavailable metric (battery/GPU/storage
+        # temp) unguarded would crash here on `pct / 100`. Every current call
+        # site already guards its own None case before calling in, but that
+        # makes it easy for a *future* call site to reintroduce the crash —
+        # guarding here too costs nothing and matches threshold_cp's contract.
+        if pct is None:
+            pct = 0
         inner  = width - 2
         filled = max(0, min(inner, int(pct / 100 * inner)))
         c      = threshold_cp(pct, key) if key else cp(CP_PRIMARY)
@@ -1154,13 +1393,25 @@ class FullRenderer:
         ts    = now.strftime("%H:%M:%S")
         date  = now.strftime("%Y-%m-%d")
         left  = "▸ SYSWATCH"
-        right = f"{ts}  {date} "
+        # A degraded indicator that's visible regardless of tab or whatever
+        # the footer happens to be showing (a user alert, the network-tab
+        # hint, ...) — placed in the header instead of competing with those
+        # for the footer's limited space. Shown whenever any collector has
+        # thrown recently, independent of whether --debug is on, so a
+        # degraded run is visible without having to already know to enable
+        # debug logging.
+        degraded = "⚠ " if sensors.has_recent_errors() else ""
+        right = f"{degraded}{ts}  {date} "
         self._hline(0, 0, " ", W, cp(CP_HDR))
         self._add(0, 1, left, cp(CP_HDR, bold=True))
         cx = max(len(left) + 2, (W - len(host)) // 2)
         self._add(0, cx, host, cp(CP_HDR))
         rpos = max(cx + len(host) + 1, W - len(right))
-        self._add(0, rpos, right, cp(CP_HDR))
+        # Bold (not a different color pair) when degraded: CP_WARN's
+        # foreground/background combination isn't guaranteed to match the
+        # header bar's, and swapping it in here would leave a
+        # differently-colored patch breaking up the otherwise continuous bar.
+        self._add(0, rpos, right, cp(CP_HDR, bold=bool(degraded)))
 
     def _render_tab_bar(self, active_tab):
         H, W = self.win.getmaxyx()
@@ -1177,7 +1428,7 @@ class FullRenderer:
             self._add(1, x, padded, attr)
             x += len(padded) + 1
 
-    def _render_footer(self, state):
+    def _render_footer(self, state, tab_id=None):
         H, W = self.win.getmaxyx()
         self._hline(H - 1, 0, " ", W, cp(CP_HDR))
         snap = (state or {}).get("system")
@@ -1199,13 +1450,17 @@ class FullRenderer:
                 start = W * 60 // 100
                 self._add(H - 1, start, alert_text[:W - start - 1],
                           cp(CP_CRITICAL, bold=True))
+            elif tab_id == "network":
+                right = "  [t] trust all devices "
+                rpos  = max(left_end + 1, W - len(right))
+                self._add(H - 1, rpos, right[:W - rpos], cp(CP_HDR))
             else:
                 mdl   = ((state or {}).get("model") or "unknown")[:32]
                 right = f"  {mdl} "
                 rpos  = max(left_end + 1, W - len(right))
                 self._add(H - 1, rpos, right[:W - rpos], cp(CP_HDR))
-        except (IndexError, Exception):
-            pass
+        except Exception as e:
+            _note("_render_footer", e)
 
     # ── Tab 1: SYSTEM ─────────────────────────────────────────────────────────
 
@@ -1629,7 +1884,7 @@ class FullRenderer:
             self._add(mid + 1, max(0, (W - len(sub)) // 2), sub, cp(CP_MUTED))
             return
         if not WATCHED_SERVICES:
-            msg = "No services configured. Edit WATCHED_SERVICES at the top of this file."
+            msg = "No services configured. Set [services] watch = [...] in your config (--write-default-config)."
             self._add(cy + ch // 2, max(0, (W - len(msg)) // 2), msg, cp(CP_MUTED))
             return
         row = cy + 1
@@ -2061,8 +2316,12 @@ class FullRenderer:
                         "storage_temp":  self._col(parts, 7),
                         "battery_pct":   self._col(parts, 8),
                     })
-        except Exception:
-            pass
+        except Exception as e:
+            # FileNotFoundError (no metrics.csv yet) is the overwhelmingly
+            # common case and not a bug, but this is also the only place
+            # that would ever surface e.g. a PermissionError on the file, so
+            # it's still worth a (deduplicated) record.
+            _note("FullRenderer._load_history", e)
         # _render_history assumes chronological order (filtered[0]/[-1] as the
         # oldest/newest bound of the resample grid); an out-of-order CSV — clock
         # adjustments, concatenated files, manual edits — would otherwise send
@@ -2329,9 +2588,11 @@ class FullRenderer:
             self.win.noutrefresh()
             curses.doupdate()
             return
+        active_tab_id = (self.tabs[active_tab - 1][0]
+                         if 1 <= active_tab <= len(self.tabs) else None)
         self._render_header()
         self._render_tab_bar(active_tab)
-        self._render_footer(state)
+        self._render_footer(state, tab_id=active_tab_id)
         tab_renderers = {
             "system":  lambda: self._render_system(state),
             "network": lambda: self._render_network(state),
@@ -2341,9 +2602,8 @@ class FullRenderer:
             "backup":  lambda: self._render_backup(state),
             "history": lambda: self._render_history(history_window, history_scroll),
         }
-        if 1 <= active_tab <= len(self.tabs):
-            tab_id, _label = self.tabs[active_tab - 1]
-            tab_renderers[tab_id]()
+        if active_tab_id is not None:
+            tab_renderers[active_tab_id]()
         if mode == "filter_input":
             prompt = f" FILTER: {filter_buf}_ "
             self._add(H - 2, 2, prompt, cp(CP_HILIGHT, bold=True) | curses.A_REVERSE)
@@ -2352,7 +2612,7 @@ class FullRenderer:
 
 
 # ── entry point ────────────────────────────────────────────────────────────────
-def _curses_main(stdscr, args):
+def _curses_main(stdscr, args, cfg_errors=None):
     init_colors()
     curses.curs_set(0)
     stdscr.nodelay(True)
@@ -2375,10 +2635,11 @@ def _curses_main(stdscr, args):
     signal.signal(signal.SIGINT,  lambda *_: alive.__setitem__(0, False))
     signal.signal(signal.SIGTERM, lambda *_: alive.__setitem__(0, False))
 
+    arp_thread = ARPPassiveThread()
     threads = [
         SystemThread(),
-        ARPPassiveThread(),
-        PingSweepThread(enabled=not args.no_scan),
+        arp_thread,
+        PingSweepThread(enabled=SCAN_ENABLED),
         LogThread(),
         ServiceWatchdogThread(),
         StorageThread(),
@@ -2388,13 +2649,24 @@ def _curses_main(stdscr, args):
     for t in threads:
         t.start()
 
+    if cfg_errors:
+        push_alert(f"config: {'; '.join(cfg_errors)}")
+
     renderer = FullRenderer(stdscr, tabs)
 
     while alive[0]:
         ch = stdscr.getch()
 
         if mode == "normal":
-            if ch in (ord("q"), ord("Q"), 27):
+            # Deliberately NOT treating a bare ESC (27) as quit: curses
+            # delivers a standalone 27 not just for an actual Esc keypress
+            # but also whenever an escape sequence (arrow/function keys, or
+            # a fragment from a laggy terminal/multiplexer) is split across
+            # reads and the ESCDELAY timeout elapses before the rest
+            # arrives — indistinguishable from Esc at this point. That made
+            # quitting ambiguous with routine terminal noise; q/Q is now the
+            # only way to quit.
+            if ch in (ord("q"), ord("Q")):
                 break
             elif ch == curses.KEY_RESIZE:
                 curses.update_lines_cols()
@@ -2416,6 +2688,12 @@ def _curses_main(stdscr, args):
                 filter_buf = log_filter
                 curses.curs_set(1)
                 last_render = 0.0
+            elif ch in (ord("t"), ord("T")) and _tab_id(active_tab) == "network":
+                try:
+                    arp_thread.trust_all()
+                except Exception as e:
+                    _note("trust_all (keybinding)", e)
+                last_render = 0.0
         elif mode == "filter_input":
             if ch == 27:
                 mode, filter_buf = "normal", ""
@@ -2435,8 +2713,17 @@ def _curses_main(stdscr, args):
         now = time.monotonic()
         if now - last_render >= REFRESH:
             state = get_state()
-            renderer.render(active_tab, state, log_filter, mode, filter_buf,
-                            history_window, history_scroll)
+            try:
+                # Nothing between here and curses.wrapper() catches a render
+                # bug — before this, any unhandled exception anywhere in the
+                # ~20 _render_* / _draw_* methods (a bad coordinate, an
+                # unexpected None, a negative sparkline index, ...) would
+                # propagate all the way out of curses.wrapper() and kill the
+                # whole TUI with a traceback instead of just this one frame.
+                renderer.render(active_tab, state, log_filter, mode, filter_buf,
+                                history_window, history_scroll)
+            except Exception as e:
+                _note("render", e)
             last_render = now
 
     for t in threads:
@@ -2530,6 +2817,8 @@ def _print_report(as_json):
             print("Throttle:     N/A")
     if services is None:
         print("Services:     N/A (systemctl not available)")
+    elif not services:
+        print("Services:     none configured ([services] watch is empty)")
     elif failed:
         print(f"Services:     {len(failed)} FAILED — {', '.join(failed)}")
     elif all(s["state"] == "unknown" for s in services):
@@ -2544,24 +2833,44 @@ def _print_report(as_json):
                   f"  ({fs['pct']:.1f}% used)")
 
 
+def _cli_trust_all_devices():
+    # One-shot, non-interactive equivalent of the NETWORK tab's [t] binding:
+    # snapshot the current ARP table, learn every MAC on the current network,
+    # and clear anything that would otherwise show as INTRUDER.
+    arp    = ARPPassiveThread()
+    now    = time.time()
+    net_id = arp._refresh_network_identity(now)
+    parsed = arp._parse_arp_table()
+    for mac, info in parsed.items():
+        hostname = _resolve_hostname(info["ip"])
+        known_devices.remember(arp._known, net_id, mac, hostname, now)
+    arp._save(now)
+    print(f"Trusted {len(parsed)} device(s) on network '{net_id}'. "
+          f"Saved to {KNOWN_DEVICES_PATH}")
+
+
 def main():
-    global REFRESH
+    global REFRESH, WATCHED_SERVICES, THRESH, SCAN_SUBNET, SCAN_ENABLED
+    global HISTORY, TOP_N, ARP_REFRESH, WATCHDOG_REFRESH, SDCARD_REFRESH
+    global PING_CYCLE, PING_BATCH, INTRUDER_TTL, ALERT_TTL, INTRUDER_ALERTS
+    global BASELINE_WINDOW, KNOWN_DEVICES_RETENTION_DAYS
+
     parser = argparse.ArgumentParser(
         description="syswatch — deep space terminal system monitor",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
-        "--tab", type=int, default=1, metavar="N",
+        "--tab", type=int, default=None, metavar="N",
         help="start on tab N (1-based; tab count depends on detected hardware "
-             "— run with no args and check the tab bar; default 1)",
+             "— run with no args and check the tab bar; overrides config)",
     )
     parser.add_argument(
-        "--refresh", type=float, default=1.0, metavar="N",
-        help="refresh rate in seconds (default 1.0, min 0.5)",
+        "--refresh", type=float, default=None, metavar="N",
+        help="refresh rate in seconds (min 0.5; overrides config)",
     )
     parser.add_argument(
         "--no-scan", action="store_true",
-        help="disable the active ping sweep (passive ARP only)",
+        help="disable the active ping sweep (passive ARP only); overrides config",
     )
     parser.add_argument(
         "--report", action="store_true",
@@ -2572,17 +2881,92 @@ def main():
         help="with --report, output JSON instead of text",
     )
     parser.add_argument(
+        "--config", type=str, default=None, metavar="PATH",
+        help="use this config file instead of the default "
+             "($XDG_CONFIG_HOME/syswatch/config.toml)",
+    )
+    parser.add_argument(
+        "--write-default-config", action="store_true",
+        help="write a fully commented example config to the default location "
+             "(or --config PATH) and exit",
+    )
+    parser.add_argument(
+        "--force", action="store_true",
+        help="with --write-default-config, overwrite an existing file",
+    )
+    parser.add_argument(
+        "--trust-all-devices", action="store_true",
+        help="mark every device currently in the ARP table as known on this "
+             "network (same as the NETWORK tab's [t] binding), then exit",
+    )
+    parser.add_argument(
+        "--debug", action="store_true",
+        help="log every collector failure (which one, exception, full "
+             "traceback) to ~/.local/share/syswatch/debug.log",
+    )
+    parser.add_argument(
         "--version", action="version", version=f"syswatch {sensors.VERSION}",
     )
     args = parser.parse_args()
-    if args.refresh < 0.5:
-        args.refresh = 0.5
-    REFRESH = args.refresh
+    sensors.set_debug(args.debug)
+
+    if args.write_default_config:
+        path = args.config or syswatch_config.config_path_default()
+        try:
+            written = syswatch_config.write_default_config(path, force=args.force)
+        except FileExistsError:
+            print(f"Config already exists at {path} — use --force to overwrite.",
+                  file=sys.stderr)
+            sys.exit(1)
+        except OSError as e:
+            print(f"Could not write config: {e}", file=sys.stderr)
+            sys.exit(1)
+        print(f"Wrote example config to {written}")
+        return
+
+    config, cfg_errors = syswatch_config.load_config(args.config)
+
+    # CLI flags override the config file.
+    if args.no_scan:
+        config["network"]["scan"] = False
+    if args.refresh is not None:
+        config["ui"]["refresh"] = args.refresh
+    if args.tab is not None:
+        config["ui"]["default_tab"] = args.tab
+
+    WATCHED_SERVICES = config["services"]["watch"]
+    THRESH           = config["thresholds"]
+    SCAN_SUBNET       = config["network"]["subnet"]
+    SCAN_ENABLED      = config["network"]["scan"]
+    INTRUDER_ALERTS   = config["network"]["intruder_alerts"]
+    ARP_REFRESH       = config["network"]["arp_refresh"]
+    PING_CYCLE        = config["network"]["ping_cycle"]
+    PING_BATCH        = config["network"]["ping_batch"]
+    INTRUDER_TTL      = config["network"]["intruder_ttl"]
+    BASELINE_WINDOW   = config["network"]["baseline_window"]
+    KNOWN_DEVICES_RETENTION_DAYS = config["network"]["known_devices_retention_days"]
+    HISTORY           = config["ui"]["history"]
+    TOP_N             = config["ui"]["top_n"]
+    ALERT_TTL         = config["ui"]["alert_ttl"]
+    WATCHDOG_REFRESH  = config["ui"]["watchdog_refresh"]
+    SDCARD_REFRESH    = config["ui"]["storage_refresh"]
+    REFRESH           = max(0.5, config["ui"]["refresh"])
+
+    if args.trust_all_devices:
+        for e in cfg_errors:
+            print(f"config: {e}", file=sys.stderr)
+        _cli_trust_all_devices()
+        return
+
     if args.report:
+        for e in cfg_errors:
+            print(f"config: {e}", file=sys.stderr)
         _print_report(args.json)
         return
+
+    args.tab = config["ui"]["default_tab"]
     try:
-        curses.wrapper(lambda stdscr: _curses_main(stdscr, args))
+        curses.wrapper(lambda stdscr: _curses_main(stdscr, args, cfg_errors))
     except KeyboardInterrupt:
         pass
     print("\nSYSWATCH — DISCONNECTED\n")

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """syswatch_sensors — platform/sensor detection shared by syswatch and syswatch-logger"""
 
+import collections
 import glob
 import ipaddress
 import json
@@ -8,11 +9,85 @@ import os
 import re
 import shutil
 import subprocess
+import threading
 import time
+import traceback
+from datetime import datetime as _dt
 
 import psutil
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
+
+# ── debug logging ─────────────────────────────────────────────────────────────
+# A shared, dependency-free error-tracking facility used by syswatch.py and
+# syswatch-logger.py: every collector's bare `except Exception` calls
+# note_error() instead of silently passing, so a broken sensor (raises) can be
+# told apart from an absent one (returns None by design). Tracking is always
+# on (cheap: one deque append under a lock) so has_recent_errors() can drive a
+# "degraded" indicator even when nobody opted into --debug; writing the actual
+# traceback to DEBUG_LOG_PATH only happens once set_debug(True) is called —
+# with debug off, behaviour is unchanged from before this facility existed.
+
+DEBUG_LOG_PATH = os.path.expanduser("~/.local/share/syswatch/debug.log")
+
+_debug_enabled = False
+_error_lock    = threading.Lock()
+_recent_errors = collections.deque(maxlen=200)  # (monotonic_ts, collector)
+_last_logged   = {}  # collector -> monotonic ts of last debug.log write
+_LOG_DEDUP_WINDOW = 60.0  # seconds — a collector that fails every cycle (e.g.
+                          # a genuinely absent sensor probed once a second)
+                          # gets one debug.log entry per window, not one per
+                          # cycle, so a long --debug run stays readable.
+
+
+def set_debug(enabled):
+    global _debug_enabled
+    _debug_enabled = bool(enabled)
+
+
+def is_debug():
+    return _debug_enabled
+
+
+def note_error(collector, exc=None):
+    now = time.monotonic()
+    with _error_lock:
+        _recent_errors.append((now, collector))
+        if not _debug_enabled:
+            return
+        last = _last_logged.get(collector)
+        if last is not None and now - last < _LOG_DEDUP_WINDOW:
+            return
+        _last_logged[collector] = now
+    try:
+        d = os.path.dirname(DEBUG_LOG_PATH)
+        if d:
+            os.makedirs(d, exist_ok=True)
+        with open(DEBUG_LOG_PATH, "a") as f:
+            ts = _dt.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+            f.write(f"[{ts}] {collector}\n")
+            if exc is not None:
+                f.write("".join(
+                    traceback.format_exception(type(exc), exc, exc.__traceback__)))
+            f.write("\n")
+    except Exception:
+        pass  # debug logging itself must never be a new source of crashes
+
+
+def has_recent_errors(window=15.0):
+    now = time.monotonic()
+    with _error_lock:
+        while _recent_errors and now - _recent_errors[0][0] > window:
+            _recent_errors.popleft()
+        return len(_recent_errors) > 0
+
+
+def log_uncaught_thread_exception(args):
+    """Install as threading.excepthook so a thread that dies from something
+    escaping its own run() loop is recorded instead of just quietly ending."""
+    name = args.thread.name if args.thread is not None else "unknown"
+    note_error(f"thread:{name} (uncaught, thread exiting)", args.exc_value)
+
 
 # ── platform identity ────────────────────────────────────────────────────────
 
@@ -51,7 +126,8 @@ def platform_model():
     try:
         import platform as _platform
         return _platform.machine() or "unknown"
-    except Exception:
+    except Exception as e:
+        note_error("platform_model (all sources failed)", e)
         return "unknown"
 
 
@@ -69,7 +145,8 @@ def _plausible_temp(v):
 def cpu_temp():
     try:
         temps = psutil.sensors_temperatures()
-    except Exception:
+    except Exception as e:
+        note_error("cpu_temp (psutil.sensors_temperatures)", e)
         temps = None
     if temps:
         for key in _CPU_PRIORITY_KEYS:
@@ -91,8 +168,8 @@ def cpu_temp():
     try:
         with open("/sys/class/thermal/thermal_zone0/temp") as f:
             return round(int(f.read().strip()) / 1000, 1)
-    except Exception:
-        pass
+    except Exception as e:
+        note_error("cpu_temp (thermal_zone0 fallback)", e)
     return None
 
 
@@ -114,8 +191,8 @@ def _detect_gpu_vendor():
             )
             if r.returncode == 0 and r.stdout.strip():
                 return "nvidia"
-        except Exception:
-            pass
+        except Exception as e:
+            note_error("_detect_gpu_vendor (nvidia-smi)", e)
     for hwmon_name in glob.glob("/sys/class/drm/card*/device/hwmon/hwmon*/name"):
         try:
             with open(hwmon_name) as f:
@@ -125,7 +202,8 @@ def _detect_gpu_vendor():
             pass
     try:
         temps = psutil.sensors_temperatures()
-    except Exception:
+    except Exception as e:
+        note_error("_detect_gpu_vendor (psutil.sensors_temperatures)", e)
         temps = None
     if temps and "i915" in temps:
         return "intel"
@@ -154,7 +232,8 @@ def _read_gpu_temp_nvidia():
         name, temp_str = [p.strip() for p in r.stdout.strip().split(",", 1)]
         temp = float(temp_str)
         return {"vendor": "NVIDIA", "label": name, "temp": temp}
-    except Exception:
+    except Exception as e:
+        note_error("_read_gpu_temp_nvidia", e)
         return None
 
 
@@ -176,7 +255,8 @@ def _read_gpu_temp_amd():
 def _read_gpu_temp_intel():
     try:
         temps = psutil.sensors_temperatures()
-    except Exception:
+    except Exception as e:
+        note_error("_read_gpu_temp_intel", e)
         return None
     entries = (temps or {}).get("i915")
     if not entries:
@@ -220,16 +300,16 @@ def root_device():
             if p.mountpoint == "/":
                 partition = p.device
                 break
-    except Exception:
-        pass
+    except Exception as e:
+        note_error("root_device (psutil.disk_partitions)", e)
     if partition is None:
         try:
             r = subprocess.run(["findmnt", "-no", "SOURCE", "/"],
                                 capture_output=True, text=True, timeout=2)
             if r.returncode == 0 and r.stdout.strip():
                 partition = r.stdout.strip()
-        except Exception:
-            pass
+        except Exception as e:
+            note_error("root_device (findmnt)", e)
 
     base = None
     if partition:
@@ -239,8 +319,8 @@ def root_device():
                                 capture_output=True, text=True, timeout=2)
             if r.returncode == 0 and r.stdout.strip():
                 base = r.stdout.strip().splitlines()[0].strip()
-        except Exception:
-            pass
+        except Exception as e:
+            note_error("root_device (lsblk)", e)
         if not base:
             m = re.match(r"^(mmcblk\d+|nvme\d+n\d+|sd[a-z]+|vd[a-z]+|xvd[a-z]+)", dev_name)
             base = m.group(1) if m else dev_name
@@ -268,7 +348,8 @@ def root_device():
 def boot_mount():
     try:
         mounts = {p.mountpoint for p in psutil.disk_partitions()}
-    except Exception:
+    except Exception as e:
+        note_error("boot_mount (psutil.disk_partitions)", e)
         mounts = set()
     for candidate in ("/boot/firmware", "/boot", "/boot/efi"):
         if candidate in mounts:
@@ -283,7 +364,8 @@ _STORAGE_TEMP_TTL   = 60.0
 def _read_storage_temp_psutil():
     try:
         temps = psutil.sensors_temperatures()
-    except Exception:
+    except Exception as e:
+        note_error("_read_storage_temp_psutil", e)
         return None
     entries = (temps or {}).get("nvme")
     if not entries:
@@ -304,7 +386,8 @@ def _read_storage_temp_smartctl(base, kind):
         try:
             r = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
             data = json.loads(r.stdout)
-        except Exception:
+        except Exception as e:
+            note_error("_read_storage_temp_smartctl", e)
             continue
         if not isinstance(data, dict):
             continue
@@ -356,7 +439,8 @@ def local_networks():
     try:
         addrs = psutil.net_if_addrs()
         stats = psutil.net_if_stats()
-    except Exception:
+    except Exception as e:
+        note_error("local_networks (psutil.net_if_addrs/stats)", e)
         return nets
     for iface, iface_addrs in addrs.items():
         if iface == "lo" or iface.startswith("lo"):
