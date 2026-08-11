@@ -100,10 +100,19 @@ def load(path=None):
 
 
 def save(data, path=None):
+    """Persist the allowlist. Returns True on success, False if it could not be
+    written (read-only home, full disk, bad permissions).
+
+    Swallowing the failure entirely made a write error indistinguishable from a
+    successful save: pressing [t] cleared the INTRUDER flags on screen, but
+    nothing reached disk, so every device was flagged again on the next run with
+    no clue why. The file format and keying are unchanged — only the caller's
+    ability to notice a failure is."""
     try:
         _atomic_write_json(path or DEFAULT_PATH, data)
+        return True
     except Exception:
-        pass
+        return False
 
 
 def prune(data, retention_days=90, now=None):
@@ -122,6 +131,13 @@ def prune(data, retention_days=90, now=None):
 
 def is_known(data, net_id, mac):
     return mac in data.get(net_id, {})
+
+
+def has_network(data, net_id):
+    """Whether this network identity has any remembered devices at all —
+    i.e. whether it's a network syswatch already knows, as opposed to one
+    it's seeing for the first time."""
+    return bool(data.get(net_id))
 
 
 def remember(data, net_id, mac, hostname=None, now=None):
