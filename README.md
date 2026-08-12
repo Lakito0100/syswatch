@@ -1,6 +1,6 @@
 # syswatch
 
-A terminal system monitor for Linux — Debian, Ubuntu, Pop!_OS, Raspberry Pi OS, and most other systemd-based distros. syswatch displays CPU usage, memory, temperature (CPU, GPU, and storage, whatever sensors the machine actually has), battery charge, network activity, connected devices, live journal logs, systemd service health, storage health, and (on machines with it installed) backup status — all in a single curses TUI that refreshes every second.
+A terminal system monitor for Linux (Debian, Ubuntu, Pop!_OS, Raspberry Pi OS, and most other systemd-based distros). syswatch displays CPU usage, memory, temperature (CPU, GPU, and storage, whatever sensors the machine actually has), battery charge, network activity, connected devices, live journal logs, systemd service health, storage health, and (on machines with it installed) backup status — all in a single curses TUI that refreshes every second.
 
 syswatch detects the hardware it's running on and adapts: Raspberry Pi throttle flags and core voltage only appear on a Pi; GPU temperature is read from whichever of NVIDIA (`nvidia-smi`), AMD (sysfs `hwmon`), or Intel (`psutil`'s `i915` sensor) is actually present; the STORAGE tab reads SMART data from whatever the root filesystem actually sits on (NVMe, SATA, SD/eMMC); rows with no available sensor are hidden rather than shown as `N/A`.
 
