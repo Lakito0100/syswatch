@@ -271,7 +271,9 @@ class SystemThreadTests(unittest.TestCase):
         m._top_procs = probe
         t = col.SystemThread()
         t._metrics = m
-        with mock.patch.object(st.settings, "THRESH", {"cpu_temp": (70, 80)}):
+        # Thresholds out of reach: this runs the real collector, and a warm
+        # test machine must not append to the user's real temp_alerts.log.
+        with mock.patch.object(st.settings, "THRESH", {"cpu_temp": (1000, 1000)}):
             t.start()
             time.sleep(0.5)
             t.stop()

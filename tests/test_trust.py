@@ -301,11 +301,24 @@ class DeviceTrustNeverEnablesScanningTests(_TrustBase):
 
 
 class CliTrustTests(unittest.TestCase):
+    """Runs the real CLI/TUI against this machine's real network identity,
+    but in a throwaway HOME and with a fake `ping` first on PATH: these
+    tests confirm trust (in that throwaway HOME), and a TUI left running for
+    a few seconds afterwards must never be able to sweep whatever network
+    the test machine is on. The fake only records its arguments."""
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
+        fake_bin = os.path.join(self.tmp.name, "fakebin")
+        os.makedirs(fake_bin)
+        self.ping_log = os.path.join(self.tmp.name, "ping.log")
+        with open(os.path.join(fake_bin, "ping"), "w") as f:
+            f.write(f'#!/bin/sh\necho "$@" >> "{self.ping_log}"\nexit 1\n')
+        os.chmod(os.path.join(fake_bin, "ping"), 0o755)
         self.env = dict(os.environ, HOME=self.tmp.name,
-                        XDG_CONFIG_HOME=os.path.join(self.tmp.name, "cfg"))
+                        XDG_CONFIG_HOME=os.path.join(self.tmp.name, "cfg"),
+                        PATH=fake_bin + os.pathsep + os.environ.get("PATH", ""))
         self.env.pop("SUDO_USER", None)
         self.script = os.path.join(helpers.ROOT, "syswatch.py")
         self.trust_file = os.path.join(self.tmp.name, ".local", "share", "syswatch",
