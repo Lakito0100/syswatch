@@ -42,6 +42,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import syswatch_sensors as sensors
 import syswatch_config
 import syswatch_known_devices as known_devices
+import syswatch_trusted_networks as trusted_networks
 
 # A thread whose run() loop somehow lets an exception escape its own
 # try/except would otherwise just die silently — no crash, no signal, the
@@ -101,8 +102,7 @@ NUM_CORES     = psutil.cpu_count(logical=True) or 4
 
 WATCHED_SERVICES = []
 THRESH            = {}
-SCAN_SUBNET       = "192.168.1.0/24"
-SCAN_MODE         = "known"  # "known" | "always" | "never"
+SCAN_MODE         = "trusted"  # "trusted" | "never" — see PingSweepThread
 HISTORY           = 60
 REFRESH           = 1.0
 TOP_N             = 5
@@ -122,6 +122,9 @@ KNOWN_DEVICES_RETENTION_DAYS = 90
 # unprivileged run would never look. The file's format and keying are
 # unchanged; only which directory it's found in.
 KNOWN_DEVICES_PATH = sensors.user_data_path("known_devices.json")
+# Networks the user explicitly confirmed for active scanning — separate from
+# the device allowlist above; see syswatch_trusted_networks.py.
+TRUSTED_NETWORKS_PATH = sensors.user_data_path("trusted_networks.json")
 
 def build_tabs():
     tabs = [
@@ -688,17 +691,19 @@ class ARPPassiveThread(threading.Thread):
     BASELINE_WINDOW seconds is learned silently instead of alerted on.
     """
 
-    def __init__(self):
+    def __init__(self, trust=None):
         super().__init__(daemon=True)
         self._stop_event    = threading.Event()
         self._known         = known_devices.load(KNOWN_DEVICES_PATH)
+        self._trust         = trust if trust is not None else NetworkTrust()
         self._net_id        = None
-        self._net_known     = False  # was self._net_id already in the allowlist when detected
+        self._net_cidrs     = []
+        self._net_seen      = False  # was self._net_id already in the allowlist when detected
         self._baseline_until = 0.0
         self._dirty          = False  # unsaved change of any kind
         self._dirty_new      = False  # ...that adds a MAC (saved promptly)
         self._last_save      = 0.0
-        # Guards self._known/_net_known/_baseline_until/_dirty*: trust_all()
+        # Guards self._known/_net_seen/_baseline_until/_dirty*: trust_all()
         # runs on the UI thread while run() mutates the same allowlist, and
         # without this a save()'s prune — which *replaces* self._known —
         # could land mid-trust and silently drop every device just trusted.
@@ -732,46 +737,55 @@ class ARPPassiveThread(threading.Thread):
         return result
 
     def _refresh_network_identity(self, now):
-        try:
-            nets = sensors.local_networks()
-        except Exception as e:
-            _note("ARPPassiveThread._refresh_network_identity", e)
-            nets = []
-        net_id = known_devices.network_identity(nets)
+        net_id, cidrs = current_network()
         with self._known_lock:
-            return self._apply_network_identity(net_id, now)
+            return self._apply_network_identity(net_id, now, cidrs)
 
-    def _apply_network_identity(self, net_id, now):
+    def _apply_network_identity(self, net_id, now, cidrs=None):
+        if cidrs is not None:
+            self._net_cidrs = list(cidrs)
         if net_id != self._net_id:
+            first = self._net_id is None
             self._net_id = net_id
             # Cached at the moment this network is detected, not re-derived
             # every cycle: baseline learning below writes newly-seen devices
             # into self._known within moments of arriving on a brand new
-            # network, which would otherwise flip "known" true almost
-            # immediately regardless of whether the user ever trusted it.
-            # trust_all() is the only thing allowed to flip it mid-session —
-            # see [network] scan = "known" (SCAN_MODE) in main().
-            self._net_known = known_devices.has_network(self._known, net_id)
+            # network, which would otherwise end the silent-learning window
+            # almost immediately. (This only governs INTRUDER flagging; it
+            # has nothing to do with scanning — see NetworkTrust.)
+            self._net_seen = known_devices.has_network(self._known, net_id)
             # Only a genuinely unseen network gets a silent learning window —
             # a network we already have an allowlist for classifies devices
             # correctly (known vs. not) from the very first cycle.
-            self._baseline_until = now + BASELINE_WINDOW if not self._net_known else 0.0
-            self._publish_network_meta()
+            self._baseline_until = now + BASELINE_WINDOW if not self._net_seen else 0.0
+            if not first:
+                # Devices listed for the previous network don't belong to
+                # this one; leaving them would let [t] trust them *here*.
+                with _state_lock:
+                    _state["devices"] = {}
+        self._publish_network_meta()
         return self._net_id
 
-    def current_network_known(self):
-        """Whether the network syswatch is currently on was already in
-        known_devices.json when detected. Drives [network] scan = "known"
-        (PingSweepThread) and the NETWORK tab's passive-only indicator."""
-        return self._net_known
+    def current_network_id(self):
+        return self._net_id
+
+    def publish_network_meta(self):
+        """Re-publish after the scan trust changed, so the NETWORK tab
+        reflects it immediately instead of on the next ARP cycle."""
+        with self._known_lock:
+            self._publish_network_meta()
 
     def _publish_network_meta(self):
+        net_id = self._net_id
+        meta = {
+            "net_id":    net_id,
+            "cidrs":     list(self._net_cidrs),
+            "trusted":   self._trust.is_trusted(net_id),
+            "trustable": trusted_networks.trustable(net_id),
+            "scan_mode": SCAN_MODE,
+        }
         with _state_lock:
-            _state["network_meta"] = {
-                "net_id":    self._net_id,
-                "known":     self._net_known,
-                "scan_mode": SCAN_MODE,
-            }
+            _state["network_meta"] = meta
 
     def _save(self, now):
         # Callers hold self._known_lock (or own the instance outright, as the
@@ -798,7 +812,8 @@ class ARPPassiveThread(threading.Thread):
     def trust_all(self):
         """Mark every device currently listed on the NETWORK tab as known on
         the current network, and clear any INTRUDER flags. Called from the
-        TUI key binding and (via a fresh instance) --trust-all-devices."""
+        TUI key binding and (via a fresh instance) --trust-all-devices.
+        Never enables scanning — that is NetworkTrust's job alone."""
         now = time.time()
         with self._known_lock:
             net_id = self._net_id or self._refresh_network_identity(now)
@@ -811,11 +826,10 @@ class ARPPassiveThread(threading.Thread):
                 for dev in _state["devices"].values():
                     if dev.status == "INTRUDER":
                         dev.status = "Active"
-            # This network is now known, whatever scan mode is in effect — the
-            # explicit trust action is what "known" mode is waiting for.
-            self._net_known = True
+            # Deliberately does NOT touch scan permission: trusting the
+            # devices on a network only stops them being flagged INTRUDER.
+            # Scanning needs its own confirmed action ([s] then [y]).
             self._save(now)
-        self._publish_network_meta()
 
     def run(self):
         self._net_id = self._refresh_network_identity(time.time())
@@ -898,19 +912,189 @@ class ARPPassiveThread(threading.Thread):
         self._stop_event.set()
 
 
+# ── network trust (scan permission) ──────────────────────────────────────────
+def current_network():
+    """(net_id, cidrs) for the network we're on *right now*, computed fresh.
+
+    cidrs are only the local subnets that contain the default gateway — the
+    network the gateway-MAC identity actually describes. A second interface
+    on some other LAN (or a VPN) is not covered by trusting this network, so
+    it's never offered for scanning under this identity."""
+    try:
+        nets = sensors.local_networks()
+    except Exception as e:
+        _note("current_network (local_networks)", e)
+        nets = []
+    net_id = known_devices.network_identity(nets)
+    gw_ip, _mac = known_devices.default_gateway()
+    cidrs = []
+    if gw_ip:
+        try:
+            addr = ipaddress.IPv4Address(gw_ip)
+            cidrs = [str(n) for n in nets if addr in n]
+        except Exception as e:
+            _note("current_network (gateway parse)", e)
+    return net_id, cidrs
+
+
+class NetworkTrust:
+    """Thread-safe view of trusted_networks.json — the *only* thing that can
+    permit an active sweep. Shared by the UI thread (which changes it, after
+    the user confirms) and PingSweepThread (which consults it before every
+    batch). Kept separate from the device allowlist on purpose: trusting the
+    devices on a network ([t]) must never imply permission to scan it."""
+
+    def __init__(self, path=None):
+        self._path = path or TRUSTED_NETWORKS_PATH
+        self._lock = threading.Lock()
+        self._data = trusted_networks.load(self._path)
+
+    def is_trusted(self, net_id):
+        with self._lock:
+            return trusted_networks.is_trusted(self._data, net_id)
+
+    def cidrs(self, net_id):
+        with self._lock:
+            return trusted_networks.trusted_cidrs(self._data, net_id)
+
+    def _persist(self):
+        if not trusted_networks.save(self._data, self._path):
+            _note(f"trusted_networks.save (not persisted to {self._path})")
+            return False
+        sensors.chown_to_invoking_user(os.path.dirname(self._path), self._path)
+        return True
+
+    def trust(self, net_id, cidrs):
+        """Returns None on success, or a human-readable reason it refused."""
+        reason = trusted_networks.untrustable_reason(net_id)
+        if reason:
+            return reason
+        if not cidrs:
+            return ("no scannable local subnet contains this network's gateway "
+                    "(subnets larger than /22 are never swept)")
+        gw = net_id[3:]
+        with self._lock:
+            trusted_networks.trust(self._data, net_id, cidrs,
+                                   label=f"{', '.join(cidrs)} via {gw}")
+            if not self._persist():
+                trusted_networks.untrust(self._data, net_id)
+                return f"could not write {self._path}"
+        return None
+
+    def untrust(self, net_id):
+        with self._lock:
+            removed = trusted_networks.untrust(self._data, net_id)
+            if removed:
+                self._persist()
+            return removed
+
+
+class ScanTrustDialog:
+    """The [s] key's two-step flow: open() shows what would be scanned,
+    and only a following [y] changes anything. Every other key cancels.
+
+    The network is captured when the dialog opens and re-checked (fresh, not
+    cached) at confirm time, and while the dialog is open: if it changed in
+    between, the confirmation is void — "yes" applies only to the network the
+    user was actually shown."""
+
+    def __init__(self, trust, network_fn=None, on_change=None):
+        self._trust      = trust
+        self._network_fn = network_fn or current_network
+        self._on_change  = on_change or (lambda: None)
+        self.pending     = None  # {"action", "net_id", "cidrs"} while open
+
+    def open(self):
+        if SCAN_MODE == "never":
+            push_alert("scanning is disabled in the config (scan = never) — nothing to trust")
+            return False
+        net_id, cidrs = self._network_fn()
+        if self._trust.is_trusted(net_id):
+            self.pending = {"action": "untrust", "net_id": net_id,
+                            "cidrs": self._trust.cidrs(net_id)}
+            return True
+        reason = trusted_networks.untrustable_reason(net_id)
+        if reason is None and not cidrs:
+            reason = ("no scannable local subnet contains this network's gateway "
+                      "(subnets larger than /22 are never swept)")
+        if reason:
+            push_alert(f"can't enable scanning: {reason}")
+            return False
+        self.pending = {"action": "trust", "net_id": net_id, "cidrs": list(cidrs)}
+        return True
+
+    def network_still_current(self):
+        if not self.pending:
+            return False
+        net_id, cidrs = self._network_fn()
+        if net_id != self.pending["net_id"]:
+            return False
+        return self.pending["action"] == "untrust" or list(cidrs) == self.pending["cidrs"]
+
+    def check_network(self):
+        """Call periodically while open: cancels if the network changed."""
+        if self.pending and not self.network_still_current():
+            self.pending = None
+            push_alert("network changed — scan confirmation cancelled, nothing changed")
+
+    def handle_key(self, ch, dialog_complete=True):
+        """Returns True if the key closed the dialog."""
+        if not self.pending or ch == -1 or ch == curses.KEY_RESIZE:
+            return False
+        pending, self.pending = self.pending, None
+        if ch not in (ord("y"), ord("Y")):
+            push_alert("cancelled — scan trust unchanged")
+            return True
+        if not dialog_complete:
+            push_alert("cancelled — enlarge the terminal so the whole warning is visible")
+            return True
+        if not self._network_still_matches(pending):
+            push_alert("network changed — scan confirmation cancelled, nothing changed")
+            return True
+        if pending["action"] == "untrust":
+            self._trust.untrust(pending["net_id"])
+            push_alert("network untrusted — active scanning stopped")
+        else:
+            reason = self._trust.trust(pending["net_id"], pending["cidrs"])
+            if reason:
+                push_alert(f"can't enable scanning: {reason}")
+            else:
+                push_alert(f"network trusted — active scanning of {', '.join(pending['cidrs'])} enabled")
+        self._on_change()
+        return True
+
+    def _network_still_matches(self, pending):
+        saved, self.pending = self.pending, pending
+        try:
+            return self.network_still_current()
+        finally:
+            self.pending = saved
+
+
 # ── PingSweepThread ────────────────────────────────────────────────────────────
 class PingSweepThread(threading.Thread):
-    def __init__(self, scan_mode="known", is_network_known=None):
+    """Active ping sweep — the one thing syswatch does that a network can
+    notice. It runs only when *all* of these hold, and they're re-checked from
+    scratch before every single batch, not just once per cycle:
+
+      * scan mode is "trusted" (there is no unconditional mode),
+      * the network we're on right now — identity computed fresh here, not a
+        cached copy from another thread — is in trusted_networks.json, which
+        only an explicit, confirmed user action ever writes, and
+      * each address pinged lies in a subnet that was confirmed when the
+        network was trusted *and* is still local.
+
+    There is no fallback target: if no trusted subnet is local, nothing is
+    pinged (the old SCAN_SUBNET / "guess a /24 from our own IP" fallbacks
+    could sweep a subnet unrelated to the network the user had trusted).
+    """
+
+    def __init__(self, scan_mode="trusted", trust=None, network_fn=None):
         super().__init__(daemon=True)
         self._stop_event = threading.Event()
-        self._scan_mode  = scan_mode  # "known" | "always" | "never"
-        # Callable checked live (not just at construction) so a network
-        # switch or a mid-run [t] trust is picked up without restarting —
-        # reuses ARPPassiveThread.current_network_known(), the same
-        # network-identity function known_devices.json is keyed by, rather
-        # than inventing a second notion of "this network" here.
-        self._is_network_known = is_network_known or (lambda: False)
-        self._networks = []  # local networks to sweep, from sensors.local_networks()
+        self._scan_mode  = scan_mode  # "trusted" | "never"
+        self._trust      = trust if trust is not None else NetworkTrust()
+        self._network_fn = network_fn or current_network
         # Resolved once at construction, not per-batch: the "nice ping ..." on
         # every batch used to mean a missing `ping` never raised
         # FileNotFoundError (the *wrapper*, "nice", was still found and would
@@ -923,61 +1107,28 @@ class PingSweepThread(threading.Thread):
         self._ping_path = shutil.which("ping")
         self._nice_path = shutil.which("nice")
         self._binary_available = self._ping_path is not None
-        if not self._binary_available:
+        if not self._binary_available and scan_mode == "trusted":
             _note("PingSweepThread.__init__ (ping not found)")
 
-    def _should_scan(self):
-        if not self._binary_available:
-            return False
-        if self._scan_mode == "always":
-            return True
-        if self._scan_mode == "never":
-            return False
-        return self._is_network_known()
-
-    @staticmethod
-    def _detect_prefix():
-        # Last-resort fallback if sensors.local_networks() finds nothing: derive
-        # a /24 from our own primary IPv4 address. The UDP socket sends nothing;
-        # connecting just makes the kernel choose the outbound interface so
-        # getsockname() reveals our address.
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            try:
-                s.connect(("8.8.8.8", 80))
-                ip = s.getsockname()[0]
-            finally:
-                s.close()
-            octets = ip.split(".")
-            if len(octets) == 4:
-                return ".".join(octets[:3])
-        except Exception as e:
-            _note("PingSweepThread._detect_prefix", e)
-        return None
-
-    def _detect_networks(self):
-        nets = sensors.local_networks()
-        if nets:
-            return nets
-        prefix = self._detect_prefix()
-        if prefix:
-            try:
-                return [ipaddress.IPv4Network(f"{prefix}.0/24")]
-            except Exception as e:
-                _note("PingSweepThread._detect_networks", e)
-        return []
-
-    def _all_ips(self):
-        # Sweep every detected local network (e.g. 192.168.178.0/24). If none
-        # were detected, fall back to the configured SCAN_SUBNET CIDR.
-        if self._networks:
-            return [str(h) for net in self._networks for h in net.hosts()]
-        try:
-            net = ipaddress.IPv4Network(SCAN_SUBNET, strict=False)
-            return [str(h) for h in net.hosts()]
-        except Exception as e:
-            _note("PingSweepThread._all_ips", e)
+    def _allowed_networks(self):
+        """The subnets it's permitted to ping right now, or [] for none."""
+        if not self._binary_available or self._scan_mode != "trusted":
             return []
+        net_id, local = self._network_fn()
+        if not self._trust.is_trusted(net_id):
+            return []
+        local = set(local)
+        out = []
+        for c in self._trust.cidrs(net_id):
+            if c in local:
+                try:
+                    out.append(ipaddress.IPv4Network(c))
+                except Exception as e:
+                    _note("PingSweepThread._allowed_networks", e)
+        return out
+
+    def _should_scan(self):
+        return bool(self._allowed_networks())
 
     def _kill_and_reap(self, p, timeout=1):
         # p.kill() alone leaves a zombie until something waits on it — every
@@ -1032,36 +1183,38 @@ class PingSweepThread(threading.Thread):
                 self._kill_and_reap(p)
         return alive
 
-    # While gated off in "known" mode, re-check this often rather than
-    # waiting out a full PING_CYCLE — so a network switch or a fresh [t]
-    # trust starts sweeping promptly instead of after several minutes.
-    _KNOWN_MODE_POLL = 5.0
+    # While gated off, re-check this often rather than waiting out a full
+    # PING_CYCLE — so a freshly confirmed trust starts sweeping promptly.
+    _GATED_POLL = 5.0
 
     def run(self):
         while not self._stop_event.is_set():
-            if not self._should_scan():
-                wait = (self._KNOWN_MODE_POLL
-                        if self._scan_mode == "known" and self._binary_available
+            try:
+                nets = self._allowed_networks()
+            except Exception as e:
+                _note("PingSweepThread.run (gate)", e)
+                nets = []
+            if not nets:
+                wait = (self._GATED_POLL
+                        if self._scan_mode == "trusted" and self._binary_available
                         else PING_CYCLE)
                 self._stop_event.wait(wait)
                 continue
             try:
-                # Re-detected every cycle, not once at startup: on a laptop
-                # that changes networks (or a Pi whose DHCP lease arrives
-                # after syswatch starts) a one-time detection kept sweeping
-                # the old subnet — or the SCAN_SUBNET fallback — forever.
-                self._networks = self._detect_networks()
-                ips   = self._all_ips()
+                ips   = [str(h) for net in nets for h in net.hosts()]
                 delay = PING_CYCLE / max(1, len(ips) / PING_BATCH)
                 for i in range(0, len(ips), PING_BATCH):
                     if self._stop_event.is_set():
                         return
-                    if not self._should_scan():
-                        # Network changed to an unknown one (or was
-                        # untrusted) mid-sweep — stop rather than finish
-                        # sweeping a network we're no longer supposed to.
+                    # Re-derive permission before every batch: a network
+                    # change, an untrust, or a subnet that's no longer
+                    # local stops the sweep within one batch.
+                    allowed = self._allowed_networks()
+                    batch = [ip for ip in ips[i:i + PING_BATCH]
+                             if any(ipaddress.IPv4Address(ip) in n for n in allowed)]
+                    if len(batch) != len(ips[i:i + PING_BATCH]):
                         break
-                    alive = self._ping_batch(ips[i:i + PING_BATCH])
+                    alive = self._ping_batch(batch)
                     now   = time.time()
                     with _state_lock:
                         for ip in alive:
@@ -1615,6 +1768,7 @@ class FullRenderer:
         win.timeout(100)
         win.keypad(True)
         self._hist_cache = None  # (checked_at: float, rows: list, file_sig)
+        self.dialog_complete = False  # last confirm dialog was drawn in full
         self.hist_scroll_max = 0  # highest valid Tab 7 scroll offset (charts)
 
     # ── primitives ────────────────────────────────────────────────────────────
@@ -2064,55 +2218,118 @@ class FullRenderer:
     # ── Tab 2: NETWORK SCANNER ────────────────────────────────────────────────
 
     @staticmethod
-    def _network_status_variants(passive_only, has_intruder):
-        # Longest-first; _render_network_status picks the longest one that
-        # fits the terminal width, down to a "[t] trust" floor that never
-        # overflows even the narrowest usable terminal.
-        if passive_only:
-            return (
-                [
-                    "PASSIVE-ONLY — unknown network. Press [t] to trust it and enable active scanning.",
-                    "PASSIVE-ONLY — unknown network — [t] trust to enable scanning",
-                    "PASSIVE-ONLY (unknown net) · [t] trust to scan",
-                    "PASSIVE-ONLY · [t] trust to scan",
-                    "[t] trust to scan",
-                    "[t] trust",
-                ],
-                cp(CP_WARN, bold=True),
-            )
-        if has_intruder:
-            return (
-                [
-                    "INTRUDER(S) FLAGGED — press [t] to trust all devices on this network and clear them",
-                    "INTRUDER(S) FLAGGED — [t] trust all devices to clear",
-                    "INTRUDER(S) FLAGGED · [t] trust all devices",
-                    "[t] trust all devices (clears INTRUDER)",
-                    "[t] trust all devices",
-                    "[t] trust",
-                ],
-                cp(CP_CRITICAL, bold=True),
-            )
-        return (
-            [
-                "[t] trust all devices on this network",
-                "[t] trust all devices",
-                "[t] trust",
-            ],
-            cp(CP_MUTED),
-        )
+    def _scan_status_variants(scan_mode, trusted, trustable):
+        """(variants longest-first, attr) for the scan half of the NETWORK
+        tab's status line."""
+        if scan_mode == "never":
+            return (["SCANNING DISABLED (scan = never) — passive only",
+                     "SCANNING DISABLED · passive only",
+                     "PASSIVE ONLY"], cp(CP_MUTED))
+        if trusted:
+            return (["ACTIVE SCANNING — trusted network · [s] stop & untrust",
+                     "SCANNING · [s] stop & untrust",
+                     "SCANNING · [s] stop",
+                     "[s] stop"], cp(CP_GOOD, bold=True))
+        if not trustable:
+            return (["PASSIVE-ONLY — network can't be identified (no gateway MAC), scanning unavailable",
+                     "PASSIVE-ONLY — unidentified network, can't scan",
+                     "PASSIVE-ONLY",
+                     "PASSIVE"], cp(CP_WARN, bold=True))
+        return (["PASSIVE-ONLY — [s] trust this network & enable scanning (asks first)",
+                 "PASSIVE-ONLY — [s] trust network & scan (asks first)",
+                 "PASSIVE-ONLY · [s] trust & scan",
+                 "PASSIVE · [s] scan",
+                 "[s] scan"], cp(CP_WARN, bold=True))
 
-    def _render_network_status(self, y, w, passive_only, has_intruder):
-        # One combined line for both the "why is this tab showing so little"
-        # explanation and the [t] trust binding — folded together rather
-        # than drawn as two separate notices, and reflecting current state:
-        # emphasized (warn) when this network isn't scanned yet in "known"
-        # mode, emphasized (critical) when trusting would clear an
-        # INTRUDER, de-emphasized otherwise since it's just available.
-        variants, attr = self._network_status_variants(passive_only, has_intruder)
+    @staticmethod
+    def _device_status_variants(has_intruder):
+        if has_intruder:
+            return (["INTRUDER(S) FLAGGED — [t] trust all devices to clear (does not enable scanning)",
+                     "INTRUDER(S) — [t] trust all devices",
+                     "INTRUDER · [t] trust devices",
+                     "[t] trust devices",
+                     "[t] trust"], cp(CP_CRITICAL, bold=True))
+        return (["[t] trust all devices (stops INTRUDER flags; does not scan)",
+                 "[t] trust all devices",
+                 "[t] trust devices",
+                 "[t] trust"], cp(CP_MUTED))
+
+    def _render_network_status(self, y, w, meta, has_intruder):
+        # Two independent actions, shown side by side so neither can be
+        # mistaken for the other: [t] trusts *devices* (INTRUDER flags only)
+        # and [s] trusts the *network* for active scanning, after a
+        # confirmation. The device hint is never dropped while an INTRUDER is
+        # flagged, so on a narrow terminal the scan half shrinks first.
+        scan_v, scan_attr = self._scan_status_variants(
+            meta.get("scan_mode", SCAN_MODE), meta.get("trusted", False),
+            meta.get("trustable", False))
+        dev_v, dev_attr = self._device_status_variants(has_intruder)
         max_w = max(0, w - 1)
-        text = next((v for v in variants if len(v) <= max_w), variants[-1][:max_w])
+        sep = "   "
+        for sv in scan_v:
+            for dv in dev_v:
+                if len(sv) + len(sep) + len(dv) <= max_w:
+                    self._add(y, 0, sv, scan_attr)
+                    self._add(y, len(sv) + len(sep), dv, dev_attr)
+                    return
+        first, attr = (dev_v, dev_attr) if has_intruder else (scan_v, scan_attr)
+        text = next((v for v in first if len(v) <= max_w), first[-1][:max_w])
         if text:
             self._add(y, 0, text, attr)
+
+    def _render_confirm_dialog(self, pending):
+        """Modal "are you sure?" box for trusting/untrusting the current
+        network for active scanning. Only [y] confirms (handled in
+        _curses_main); every other key cancels."""
+        H, W = self.win.getmaxyx()
+        cidrs = pending.get("cidrs") or []
+        if pending.get("action") == "untrust":
+            title = " STOP SCANNING THIS NETWORK? "
+            body = [
+                f"Network: {pending.get('net_id')}",
+                f"Subnets: {', '.join(cidrs) or '-'}",
+                "",
+                "syswatch will stop the active ping sweep here and forget",
+                "that this network is trusted for scanning. Known devices",
+                "are kept.",
+                "",
+                "[y] Yes, untrust      any other key: cancel",
+            ]
+            attr = cp(CP_WARN, bold=True)
+        else:
+            hosts = trusted_networks.host_count(cidrs)
+            title = " ENABLE ACTIVE SCANNING ON THIS NETWORK? "
+            body = [
+                f"Network: {pending.get('net_id')}",
+                f"Will ping every address in: {', '.join(cidrs)} ({hosts} hosts),",
+                f"repeated about every {int(PING_CYCLE)}s for as long as syswatch runs here.",
+                "",
+                "WARNING: an active sweep is visible to the network and can",
+                "trigger intrusion-detection / security alerts. Only do this",
+                "on a network you own or are allowed to scan.",
+                "",
+                "[y] Yes, trust & scan      any other key: cancel (default)",
+            ]
+            attr = cp(CP_CRITICAL, bold=True)
+        inner = max(len(title), *(len(b) for b in body))
+        box_w = min(W - 2, inner + 4)
+        box_h = min(H - 2, len(body) + 2)
+        # [y] is only honoured once the *whole* warning has been on screen —
+        # a terminal too small to show it must not let a keypress confirm
+        # something the user couldn't read.
+        self.dialog_complete = box_w >= inner + 4 and box_h >= len(body) + 2
+        x0 = max(0, (W - box_w) // 2)
+        y0 = max(0, (H - box_h) // 2)
+        self._add(y0, x0, "┌" + "─" * (box_w - 2) + "┐", attr)
+        self._add(y0, x0 + max(1, (box_w - len(title)) // 2), title[:box_w - 2], attr)
+        for i in range(box_h - 2):
+            line = body[i] if i < len(body) else ""
+            text = (" " + line).ljust(box_w - 2)[:box_w - 2]
+            self._add(y0 + 1 + i, x0, "│", attr)
+            self._add(y0 + 1 + i, x0 + 1, text,
+                      attr if line.startswith(("WARNING", "[y]")) else cp(CP_PRIMARY))
+            self._add(y0 + 1 + i, x0 + box_w - 1, "│", attr)
+        self._add(y0 + box_h - 1, x0, "└" + "─" * (box_w - 2) + "┘", attr)
 
     def _render_network(self, state):
         H, W = self.win.getmaxyx()
@@ -2121,15 +2338,9 @@ class FullRenderer:
         self._label(cy, 0, "NETWORK SCANNER")
         devices      = state.get("devices") or {}
         net_meta     = state.get("network_meta") or {}
-        scan_mode    = net_meta.get("scan_mode", SCAN_MODE)
-        net_known    = net_meta.get("known", False)
         has_intruder = any(d.status == "INTRUDER" for d in devices.values())
-        # Only "known" mode ever withholds the active sweep based on
-        # whether the network is recognised — "always"/"never" don't need
-        # this explanation since they don't depend on network identity.
-        passive_only = scan_mode == "known" and not net_known
         status_row = cy + 1
-        self._render_network_status(status_row, W, passive_only, has_intruder)
+        self._render_network_status(status_row, W, net_meta, has_intruder)
         if not devices:
             msg = "SCANNING…  (ARP TABLE EMPTY OR UNAVAILABLE)"
             self._add(cy + ch // 2, max(0, (W - len(msg)) // 2), msg, cp(CP_MUTED))
@@ -2970,9 +3181,10 @@ class FullRenderer:
     # ── dispatch ──────────────────────────────────────────────────────────────
 
     def render(self, active_tab, state, log_filter, mode, filter_buf,
-               history_window=0, history_scroll=0):
+               history_window=0, history_scroll=0, pending=None):
         H, W = self.win.getmaxyx()
         self.win.erase()
+        self.dialog_complete = False
         if H < self.MIN_H or W < self.MIN_W:
             msg = f"Terminal too small ({W}×{H}), need ≥{self.MIN_W}×{self.MIN_H}"
             self._add(H // 2, max(0, (W - len(msg)) // 2), msg, cp(CP_CRITICAL, bold=True))
@@ -2998,6 +3210,8 @@ class FullRenderer:
         if mode == "filter_input":
             prompt = f" FILTER: {filter_buf}_ "
             self._add(H - 2, 2, prompt, cp(CP_HILIGHT, bold=True) | curses.A_REVERSE)
+        if mode == "confirm_scan" and pending:
+            self._render_confirm_dialog(pending)
         self.win.noutrefresh()
         curses.doupdate()
 
@@ -3026,11 +3240,13 @@ def _curses_main(stdscr, args, cfg_errors=None):
     signal.signal(signal.SIGINT,  lambda *_: alive.__setitem__(0, False))
     signal.signal(signal.SIGTERM, lambda *_: alive.__setitem__(0, False))
 
-    arp_thread = ARPPassiveThread()
+    trust      = NetworkTrust()
+    arp_thread = ARPPassiveThread(trust=trust)
+    scan_dialog = ScanTrustDialog(trust, on_change=arp_thread.publish_network_meta)
     threads = [
         SystemThread(),
         arp_thread,
-        PingSweepThread(scan_mode=SCAN_MODE, is_network_known=arp_thread.current_network_known),
+        PingSweepThread(scan_mode=SCAN_MODE, trust=trust),
         LogThread(),
         ServiceWatchdogThread(),
         StorageThread(),
@@ -3080,10 +3296,31 @@ def _curses_main(stdscr, args, cfg_errors=None):
                 curses.curs_set(1)
                 last_render = 0.0
             elif ch in (ord("t"), ord("T")) and _tab_id(active_tab) == "network":
+                # Devices only — never scan permission (that's [s]).
                 try:
                     arp_thread.trust_all()
+                    push_alert("all listed devices trusted (scanning unchanged)")
                 except Exception as e:
                     _note("trust_all (keybinding)", e)
+                last_render = 0.0
+            elif ch in (ord("s"), ord("S")) and _tab_id(active_tab) == "network":
+                try:
+                    if scan_dialog.open():
+                        mode = "confirm_scan"
+                except Exception as e:
+                    _note("scan trust dialog (open)", e)
+                last_render = 0.0
+        elif mode == "confirm_scan":
+            if ch == curses.KEY_RESIZE:
+                curses.update_lines_cols()
+                last_render = 0.0
+            try:
+                closed = scan_dialog.handle_key(ch, renderer.dialog_complete)
+            except Exception as e:
+                _note("scan trust dialog (key)", e)
+                scan_dialog.pending, closed = None, True
+            if closed:
+                mode = "normal"
                 last_render = 0.0
         elif mode == "filter_input":
             if ch == 27:
@@ -3103,6 +3340,10 @@ def _curses_main(stdscr, args, cfg_errors=None):
 
         now = time.monotonic()
         if now - last_render >= REFRESH:
+            if mode == "confirm_scan":
+                scan_dialog.check_network()
+                if scan_dialog.pending is None:
+                    mode = "normal"
             scan_dead_threads(threads)
             state = get_state()
             try:
@@ -3113,7 +3354,7 @@ def _curses_main(stdscr, args, cfg_errors=None):
                 # propagate all the way out of curses.wrapper() and kill the
                 # whole TUI with a traceback instead of just this one frame.
                 renderer.render(active_tab, state, log_filter, mode, filter_buf,
-                                history_window, history_scroll)
+                                history_window, history_scroll, scan_dialog.pending)
             except Exception as e:
                 _note("render", e)
             last_render = now
@@ -3160,18 +3401,16 @@ def _print_report(as_json):
     if boot:
         disks[boot] = StorageThread._fs_stats(boot)
 
-    # In "known" mode, whether *this run* would actually sweep depends on
-    # whether the current network is already in known_devices.json — check
-    # it the same way PingSweepThread does, via ARPPassiveThread's
-    # network-identity function, rather than a second notion of "known".
-    network_recognised = None
-    if SCAN_MODE == "known":
+    # Whether *this run* would actually sweep: only on a network the user
+    # explicitly trusted for scanning (NetworkTrust), checked the same way
+    # PingSweepThread does it.
+    network_trusted = None
+    if SCAN_MODE == "trusted":
         try:
-            arp_probe = ARPPassiveThread()
-            arp_probe._refresh_network_identity(time.time())
-            network_recognised = arp_probe.current_network_known()
+            net_id, _cidrs = current_network()
+            network_trusted = NetworkTrust().is_trusted(net_id)
         except Exception as e:
-            _note("_print_report (scan mode probe)", e)
+            _note("_print_report (scan trust probe)", e)
 
     if as_json:
         report = {
@@ -3186,7 +3425,9 @@ def _print_report(as_json):
             "core_volts":    voltage,
             "throttled":     throttled,
             "scan_mode":     SCAN_MODE,
-            "scan_network_recognised": network_recognised,
+            "scan_network_trusted":    network_trusted,
+            # Pre-1.4 name for the same field, kept for existing consumers.
+            "scan_network_recognised": network_trusted,
             "services":      services,
             "failed_services": failed,
             "disks": {
@@ -3211,14 +3452,12 @@ def _print_report(as_json):
     gpu_suffix = f" ({gpu_info['vendor']})" if gpu_info else ""
     print(f"GPU temp:     {fmt(gpu_temp, ' °C')}{gpu_suffix}")
     print(f"Storage temp: {fmt(storage_temp, ' °C')}")
-    if SCAN_MODE == "known":
-        if network_recognised:
-            scan_line = "known — this network is recognised (sweep active)"
+    if SCAN_MODE == "trusted":
+        if network_trusted:
+            scan_line = "trusted — this network is trusted for scanning (sweep active)"
         else:
-            scan_line = ("known — this network is NOT recognised yet "
-                         "(passive-only; press [t] or run --trust-all-devices)")
-    elif SCAN_MODE == "always":
-        scan_line = "always (active sweep unconditionally)"
+            scan_line = ("trusted — this network is NOT trusted for scanning "
+                         "(passive-only; [s] on the NETWORK tab or --trust-network)")
     else:
         scan_line = "never (passive ARP only)"
     print(f"Scan mode:    {scan_line}")
@@ -3266,10 +3505,74 @@ def _cli_trust_all_devices():
     arp._save(now)
     print(f"Trusted {len(parsed)} device(s) on network '{net_id}'. "
           f"Saved to {KNOWN_DEVICES_PATH}")
+    print("This does not enable active scanning — use --trust-network for that.")
+
+
+def _cli_scan_trust(untrust=False):
+    """--trust-network / --untrust-network: the non-TUI equivalent of [s],
+    with the same warning and an explicit y/N. Refuses without a terminal:
+    there is deliberately no way to grant scan permission unattended."""
+    trust = NetworkTrust()
+    net_id, cidrs = current_network()
+    if untrust:
+        if not trust.is_trusted(net_id):
+            print(f"Network '{net_id}' is not trusted for scanning — nothing to do.")
+            return 0
+        prompt = (f"Stop scanning and untrust network '{net_id}' "
+                  f"({', '.join(trust.cidrs(net_id))})? [y/N] ")
+    else:
+        if SCAN_MODE == "never":
+            print("Note: scan = never in your config, so no scanning will happen "
+                  "until that is changed.", file=sys.stderr)
+        if trust.is_trusted(net_id):
+            print(f"Network '{net_id}' is already trusted for scanning "
+                  f"({', '.join(trust.cidrs(net_id))}).")
+            return 0
+        reason = trusted_networks.untrustable_reason(net_id)
+        if reason is None and not cidrs:
+            reason = ("no scannable local subnet contains this network's gateway "
+                      "(subnets larger than /22 are never swept)")
+        if reason:
+            print(f"Can't trust this network for scanning: {reason}", file=sys.stderr)
+            return 1
+        hosts = trusted_networks.host_count(cidrs)
+        print(f"Network:   {net_id}\n"
+              f"Will ping: {', '.join(cidrs)} ({hosts} hosts), about every "
+              f"{int(PING_CYCLE)}s while syswatch runs on this network.\n\n"
+              "WARNING: an active sweep is visible to the network and can trigger\n"
+              "intrusion-detection / security alerts. Only do this on a network\n"
+              "you own or are allowed to scan.\n")
+        prompt = "Trust this network and enable active scanning? [y/N] "
+    if not sys.stdin.isatty():
+        print("Refusing: confirmation needs an interactive terminal.", file=sys.stderr)
+        return 1
+    try:
+        answer = input(prompt)
+    except EOFError:
+        answer = ""
+    if answer.strip().lower() not in ("y", "yes"):
+        print("Cancelled — nothing changed.")
+        return 1
+    # Re-check: the answer only covers the network that was shown.
+    now_id, now_cidrs = current_network()
+    if now_id != net_id or (not untrust and now_cidrs != cidrs):
+        print("The network changed while waiting — cancelled, nothing changed.",
+              file=sys.stderr)
+        return 1
+    if untrust:
+        trust.untrust(net_id)
+        print("Network untrusted — syswatch will no longer scan it.")
+        return 0
+    reason = trust.trust(net_id, cidrs)
+    if reason:
+        print(f"Can't trust this network for scanning: {reason}", file=sys.stderr)
+        return 1
+    print(f"Network trusted — syswatch will actively scan {', '.join(cidrs)} here.")
+    return 0
 
 
 def main():
-    global REFRESH, WATCHED_SERVICES, THRESH, SCAN_SUBNET, SCAN_MODE
+    global REFRESH, WATCHED_SERVICES, THRESH, SCAN_MODE
     global HISTORY, TOP_N, ARP_REFRESH, WATCHDOG_REFRESH, SDCARD_REFRESH
     global PING_CYCLE, PING_BATCH, INTRUDER_TTL, ALERT_TTL, INTRUDER_ALERTS
     global BASELINE_WINDOW, KNOWN_DEVICES_RETENTION_DAYS
@@ -3293,11 +3596,12 @@ def main():
              "--scan never; overrides config",
     )
     parser.add_argument(
-        "--scan", type=str, default=None, choices=["known", "always", "never"],
+        "--scan", type=str, default=None, choices=["trusted", "known", "never"],
         metavar="MODE",
-        help="override [network] scan for this run: known = sweep only on "
-             "networks you've already trusted (default), always = always "
-             "sweep, never = passive ARP only",
+        help="override [network] scan for this run: trusted = sweep only "
+             "networks you explicitly trusted for scanning (default; 'known' "
+             "is an old alias), never = passive ARP only. There is no "
+             "'always' mode.",
     )
     parser.add_argument(
         "--report", action="store_true",
@@ -3325,6 +3629,16 @@ def main():
         "--trust-all-devices", action="store_true",
         help="mark every device currently in the ARP table as known on this "
              "network (same as the NETWORK tab's [t] binding), then exit",
+    )
+    parser.add_argument(
+        "--trust-network", action="store_true",
+        help="trust the current network for active scanning (shows what would "
+             "be scanned and asks y/N; needs a terminal), then exit",
+    )
+    parser.add_argument(
+        "--untrust-network", action="store_true",
+        help="stop scanning the current network and forget its scan trust "
+             "(asks y/N), then exit",
     )
     parser.add_argument(
         "--debug", action="store_true",
@@ -3359,7 +3673,7 @@ def main():
     if args.no_scan:
         config["network"]["scan"] = "never"
     if args.scan is not None:
-        config["network"]["scan"] = args.scan
+        config["network"]["scan"] = "trusted" if args.scan == "known" else args.scan
     if args.refresh is not None:
         config["ui"]["refresh"] = args.refresh
     if args.tab is not None:
@@ -3367,7 +3681,6 @@ def main():
 
     WATCHED_SERVICES = config["services"]["watch"]
     THRESH           = config["thresholds"]
-    SCAN_SUBNET       = config["network"]["subnet"]
     SCAN_MODE         = config["network"]["scan"]
     INTRUDER_ALERTS   = config["network"]["intruder_alerts"]
     ARP_REFRESH       = config["network"]["arp_refresh"]
@@ -3388,6 +3701,11 @@ def main():
             print(f"config: {e}", file=sys.stderr)
         _cli_trust_all_devices()
         return
+
+    if args.trust_network or args.untrust_network:
+        for e in cfg_errors:
+            print(f"config: {e}", file=sys.stderr)
+        sys.exit(_cli_scan_trust(untrust=args.untrust_network))
 
     if args.report:
         for e in cfg_errors:

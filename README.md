@@ -49,14 +49,16 @@ syswatch [options]
 |------|-------------|
 | `--tab N` | Start on tab N (1-based). The tab bar is built dynamically — BACKUP only appears if `project-backup` is detected, so the tab count and numbering shift depending on the machine. Run with no arguments and check the tab bar if unsure. Overrides `[ui] default_tab` in the config. |
 | `--refresh N` | Refresh interval in seconds (minimum 0.5). Overrides `[ui] refresh`. |
-| `--scan MODE` | Override `[network] scan` for this run: `known` (sweep only on networks already in `known_devices.json`), `always` (sweep unconditionally), or `never` (passive ARP only) |
+| `--scan MODE` | Override `[network] scan` for this run: `trusted` (sweep only networks you explicitly trusted for scanning — the default; `known` is accepted as the old name) or `never` (passive ARP only). There is no `always` mode. |
 | `--no-scan` | Disable active ping sweep; use passive ARP table only. Same as `--scan never`. Overrides `[network] scan`. |
 | `--report` | Print a one-shot system report to stdout and exit (no TUI) |
 | `--json` | With `--report`, output JSON instead of text |
 | `--config PATH` | Use this config file instead of the default (`$XDG_CONFIG_HOME/syswatch/config.toml`) |
 | `--write-default-config` | Write a fully commented example config to the default location (or `--config PATH`) and exit. Refuses to overwrite an existing file unless `--force` is also given. |
 | `--force` | With `--write-default-config`, overwrite an existing file |
-| `--trust-all-devices` | Mark every device currently in the ARP table as known on the current network (same as the NETWORK tab's `[t]` binding), then exit |
+| `--trust-all-devices` | Mark every device currently in the ARP table as known on the current network (same as the NETWORK tab's `[t]` binding), then exit. Only stops INTRUDER flags — it never enables scanning. |
+| `--trust-network` | Trust the current network for active scanning (same as `[s]` on the NETWORK tab): shows the network and the subnets that would be swept, warns, and asks `[y/N]`. Refuses without an interactive terminal — scan permission can't be granted from a script. |
+| `--untrust-network` | Stop scanning the current network and forget its scan trust (asks `[y/N]`). |
 | `--debug` | Log every collector failure (which one, the exception, a full traceback) to `~/.local/share/syswatch/debug.log`, deduplicated to at most one entry per collector per minute so a chronically-failing one doesn't flood the file |
 | `--version` | Print version and exit |
 
@@ -119,16 +121,16 @@ gpu_temp     = [85, 95]
 storage_temp = [65, 75]
 
 [network]
-# scan controls the active ping sweep and takes three values:
-#   "known" (default) — sweep only if the current network is already in
-#                        known_devices.json; passive ARP reading everywhere
-#                        else. Press [t] on the NETWORK tab (or run
-#                        --trust-all-devices) to mark a network as known.
-#   true / "always"    — always sweep, regardless of whether the network
-#                        is known (the old unconditional behaviour)
-#   false / "never"    — never sweep; passive ARP reading only
-scan             = "known"
-subnet           = "192.168.1.0/24"     # fallback CIDR swept when no local network is auto-detected
+# scan controls the active ping sweep:
+#   "trusted" (default) — sweep only networks you explicitly trusted for
+#                         scanning: press [s] on the NETWORK tab and confirm
+#                         with [y] (or run --trust-network). Everywhere else
+#                         syswatch only reads the ARP table passively.
+#                         Trusting *devices* ([t]) never enables scanning.
+#   "never"             — never sweep; passive reading only, on every network
+# There is deliberately no "always" mode: an active sweep of a network that
+# isn't yours can trigger its security alerts.
+scan             = "trusted"
 intruder_alerts  = true                 # flag devices never seen on this network as INTRUDER
 arp_refresh      = 2.0                  # seconds between ARP table reads
 ping_cycle       = 420                  # seconds to sweep every host once
@@ -153,7 +155,11 @@ retention_days = 30   # days of metrics.csv history kept
 
 The default `[services] watch` list is platform-aware, not baked into the example above: on a Raspberry Pi it's `ssh, networking, cron, bluetooth, avahi-daemon, triggerhappy`; on other machines syswatch checks with `systemctl` which of `ssh`/`sshd`, `cron`, `NetworkManager`/`networking`, `bluetooth` actually exist and only defaults to those — no more units guaranteed to show up as "not found".
 
-> **Behaviour change on upgrade:** `[network] scan` used to be a plain boolean defaulting to `true` (always sweep). It now defaults to `"known"` — active scanning only on networks already in `known_devices.json`. If you have no config file, or a config file that doesn't set `[network] scan` at all, you'll now get passive-ARP-only on any network you haven't already trusted, instead of the previous unconditional sweep. An existing config with `scan = true` or `scan = false` is unaffected — those keep working exactly as before. To restore the old unconditional-sweep behaviour, set `scan = true` in your config, or pass `--scan always` on the command line.
+> **Behaviour change in 1.4 — scanning needs explicit, confirmed trust.** Earlier versions started actively ping-sweeping a network as soon as it had *any* device in `known_devices.json` — which happened after pressing `[t]`, and even after just one passive session there (baseline learning) — and `scan = true` / `--scan always` swept every network unconditionally. Now:
+> - Trusting **devices** (`[t]`, `--trust-all-devices`) only stops them being flagged INTRUDER. It never enables scanning.
+> - Trusting a **network for scanning** is a separate action (`[s]` then `[y]`, or `--trust-network`) that is stored separately, in `trusted_networks.json`.
+> - Networks trusted under the old rules are **not** carried over: after upgrading, nothing is swept until you confirm a network once with `[s]`.
+> - `scan = true` / `"always"` are no longer valid. They're reported as a config warning and treated as `"trusted"`; `--scan always` is rejected. `scan = false` still means never. `[network] subnet` is no longer used (it was a fallback sweep target) and is ignored if present.
 
 ---
 
@@ -165,19 +171,38 @@ The tab bar always starts with SYSTEM, NETWORK, LOGS, SERVICES, STORAGE and ends
 Real-time CPU usage for each core plus an average bar with sparkline history. RAM and swap usage with bars, plus battery charge (percentage only) if the machine reports one — hidden entirely on desktops/servers/most Pi setups with no battery. CPU temperature, GPU temperature (vendor auto-detected: NVIDIA via `nvidia-smi`, AMD via sysfs `hwmon`, Intel via `psutil`'s `i915` sensor — on a multi-GPU machine the first GPU reported is shown), and storage temperature — each with a visual bar, and each row hidden entirely if no working sensor is found. Current CPU clock frequency. On Raspberry Pi only: core voltage and a throttle indicator showing under-voltage, frequency cap, throttle, and soft-temp-limit flags (● = active now, ○ = never) — these are Pi-specific concepts (`vcgencmd`) with no portable equivalent, so they're simply absent on other hardware. Network RX/TX rates and disk read/write rates with per-channel sparklines. Top processes by CPU (`[ui] top_n`, default 5) with PID, name, CPU%, memory%, and status.
 
 ### 2 · NETWORK
-Scans the local network using passive ARP table reading and, depending on `[network] scan` (or `--scan MODE`), an active ping sweep on top of it:
+Lists the devices on the local network — IP address, MAC address, resolved hostname, time since last seen, and status (Active / Recent / Idle / INTRUDER) — by reading the kernel's neighbour (ARP) table passively. That passive reading is all syswatch does on a network unless you explicitly allow more.
 
-- **`known`** (default) — sweep only if the network syswatch is currently on is already in `known_devices.json`; passive ARP reading only on a network it hasn't seen before. This is the "known networks only" mode: nothing gets actively probed until you've told syswatch to trust it.
-- **`always`** — sweep unconditionally, regardless of whether the network is known.
-- **`never`** — passive ARP reading only, on every network.
+**Two separate keys, two separate kinds of trust:**
 
-Scan targets are derived from the machine's own network interfaces (`psutil.net_if_addrs()`) — every up, non-loopback IPv4 interface with a subnet of /22 or smaller is swept (larger subnets are skipped so a stray /16 can't queue tens of thousands of pings; link-local and /32 addresses, e.g. a Tailscale interface, are also skipped). If no usable interface is found, it falls back to auto-detecting a single /24 from the machine's primary IPv4 address, and finally to `[network] subnet` (a CIDR, default `192.168.1.0/24`) as a last resort. Lists every discovered device with IP address, MAC address, resolved hostname, time since last seen, and status (Active / Recent / Idle / INTRUDER).
+- **`[t]` — trust all devices.** Every currently listed device is written into the [known-devices allowlist](#known-devices-allowlist) and any INTRUDER flags are cleared. That's all: it does **not** make syswatch scan the network. `syswatch --trust-all-devices` does the same without the TUI.
+- **`[s]` — trust this network and enable active scanning.** Opens a confirmation box showing:
+  - the network's identity (its gateway's MAC address)
+  - the subnet(s) that would be swept and how many hosts that is
+  - a warning that an active sweep is visible to the network and can trigger its security alerts
 
-When `scan = "known"` and the current network isn't recognised yet, the tab shows a **PASSIVE-ONLY** indicator explaining why the device list is sparse, next to a hint to press `[t]` to trust the network and enable sweeping. This is drawn inside the NETWORK tab itself (not the footer), so it stays visible on narrow terminals and regardless of whether a footer alert (e.g. INTRUDER) is currently showing.
+  **Only `[y]` confirms; any other key cancels**, and nothing changes. Once confirmed, the network is stored in `~/.local/share/syswatch/trusted_networks.json` and syswatch pings every host in those subnets about once per `[network] ping_cycle` (default 7 minutes) whenever it runs on that network. Pressing `[s]` on a network that's already trusted offers to stop scanning and untrust it, with the same `[y]`-only confirmation. `syswatch --trust-network` / `--untrust-network` are the command-line equivalents; they ask `[y/N]` and refuse to run without a terminal.
 
-**INTRUDER detection is per-network**, not just "seen after startup": a persistent allowlist (see [Known devices](#known-devices-allowlist)) tracks which MACs have been seen on which network. A device is flagged INTRUDER only if its MAC has never been seen on the network syswatch is *currently* on — so a laptop that already knows every device on its home LAN won't false-positive there, but will still flag genuinely new devices on a café Wi-Fi. The first time syswatch runs on a given network, everything discovered in the first `[network] baseline_window` seconds (default 60) is learned silently rather than alerted on. Set `[network] intruder_alerts = false` to disable the flagging (and its footer alert) entirely. Note that this passive baseline learning writes the network into `known_devices.json` too — so under `scan = "known"`, a network syswatch has run passively on for a full session will start getting actively swept the *next* time you connect to it, even without explicitly pressing `[t]`.
+Safeguards around the active sweep (`[network] scan = "trusted"`, the default):
 
-Press **`t`** while on this tab to trust every currently listed device — they're written into the allowlist and any INTRUDER flags are cleared immediately. The hint for this binding lives in the tab body itself and adapts to what's currently useful: emphasized when trusting the network is what's gating the scan, emphasized when it would clear a flagged INTRUDER, and shown de-emphasized (just available) otherwise. `syswatch --trust-all-devices` does the same thing non-interactively, without launching the TUI.
+- **Network identity is the gateway's MAC address.** A network that can only be identified by its subnet (e.g. `192.168.1.0/24`, which thousands of routers share) can't be trusted at all, so a café using the same addressing as your home never matches your home's trust. The tab says so when this applies.
+- **Permission is re-checked before every batch of pings**, from a fresh reading of the network identity — not just when the sweep starts. Leaving the trusted network (or untrusting it) stops the sweep within one batch.
+- **Only confirmed subnets are swept**: the ones that contained the gateway when you pressed `[y]`, and only while they're still local. There is no fallback target. Subnets larger than /22 are never offered, so a stray /16 can't queue tens of thousands of pings.
+- **Confirmation is tied to what you saw.** If the network changes while the box is open, or between opening it and pressing `[y]`, the confirmation is void. If the terminal is too small to show the whole warning, `[y]` doesn't count.
+- **Nothing else turns scanning on.** Baseline learning, `[t]`, and config values can't enable it. `scan = "never"` (or `--no-scan`) turns it off everywhere, even on trusted networks.
+
+The status line at the top of the tab shows the scan state:
+- `PASSIVE-ONLY — [s] trust this network & enable scanning (asks first)`
+- `ACTIVE SCANNING — trusted network · [s] stop & untrust`
+- `SCANNING DISABLED (scan = never)`
+- `PASSIVE-ONLY — network can't be identified` (no gateway MAC)
+
+The `[t]` hint sits next to it and turns red while an INTRUDER is flagged. Both are drawn inside the tab itself, not the footer, so they stay visible on narrow terminals and whatever footer alert is showing.
+
+When you switch networks, the device list is cleared, so `[t]` can never trust the previous network's devices onto the new one.
+
+**INTRUDER detection is per-network**, not just "seen after startup": a persistent allowlist (see [Known devices](#known-devices-allowlist)) tracks which MACs have been seen on which network. A device is flagged INTRUDER only if its MAC has never been seen on the network syswatch is *currently* on — so a laptop that already knows every device on its home LAN won't false-positive there, but will still flag genuinely new devices on a café Wi-Fi. The first time syswatch runs on a given network, everything discovered in the first `[network] baseline_window` seconds (default 60) is learned silently rather than alerted on. Set `[network] intruder_alerts = false` to disable the flagging (and its footer alert) entirely. Baseline learning only affects INTRUDER flagging; it never enables scanning.
+
 
 ### 3 · LOGS
 Streams the systemd journal in real time via `journalctl -f`. Shows service name, timestamp, and message for each entry. An error-rate sparkline and count in the header show errors per 60-second window. Press `/` to open the filter prompt (see below).
@@ -226,7 +251,7 @@ To run the logger directly (e.g. for testing): `python3 syswatch-logger.py [--in
 
 ## Report mode
 
-`syswatch --report` prints a one-shot snapshot to stdout and exits — no TUI, no background threads. It includes the detected hardware model, uptime, CPU/GPU/storage temperature, the active `[network] scan` mode (and, when it's `"known"`, whether the current network is recognised — i.e. whether this run would actually sweep), and (Raspberry Pi only) core voltage and throttle flags (current and since boot), the state of every watched service (failed units are called out), and disk usage for `/` and the boot partition (if it's a separate mount). Add `--json` for machine-readable output (`scan_mode` and `scan_network_recognised` fields). Config problems, if any, are printed to stderr before the report itself.
+`syswatch --report` prints a one-shot snapshot to stdout and exits — no TUI, no background threads. It includes the detected hardware model, uptime, CPU/GPU/storage temperature, the active `[network] scan` mode (and, when it's `"trusted"`, whether the current network is trusted for scanning — i.e. whether this run would actually sweep), and (Raspberry Pi only) core voltage and throttle flags (current and since boot), the state of every watched service (failed units are called out), and disk usage for `/` and the boot partition (if it's a separate mount). Add `--json` for machine-readable output (`scan_mode` and `scan_network_trusted` fields; `scan_network_recognised` is kept as an alias for older scripts). Config problems, if any, are printed to stderr before the report itself.
 
 This is designed for cron and email digests, e.g. a daily report at 07:00:
 
@@ -320,7 +345,7 @@ It's keyed by network identity — the default gateway's MAC address where obtai
 
 Writes are atomic (written to a temp file, then renamed into place), so a crash or power loss mid-write can't corrupt it. A newly learned or trusted device is saved straight away; mere `last_seen` refreshes of devices already in the file are batched and written at most every 5 minutes (and on exit), so a long-running syswatch doesn't rewrite the file every couple of seconds — which matters on a Pi's SD card. A missing, empty, truncated, or otherwise malformed file is treated as an empty allowlist rather than a crash. Entries not seen for `[network] known_devices_retention_days` (default 90) are pruned automatically. If the file genuinely can't be written (read-only home, full disk, wrong permissions) that's reported as a collector error — it lights the header ⚠ and is logged with `--debug` — rather than passing silently, which would otherwise look like `t` had worked while nothing was ever remembered between runs.
 
-Add devices to the allowlist either by pressing `t` on the NETWORK tab, or by running `syswatch --trust-all-devices` (useful for a first-time setup on a trusted network, e.g. right after install). Delete the file to reset it, or edit `known_devices_retention_days` to control how long devices are remembered on networks you don't visit often.
+Add devices to the allowlist either by pressing `t` on the NETWORK tab, or by running `syswatch --trust-all-devices` (useful for a first-time setup, e.g. right after install). Neither enables scanning — see [`[s]`](#2--network) for that; trusted-for-scanning networks live in a separate file, `trusted_networks.json`. Delete the file to reset it, or edit `known_devices_retention_days` to control how long devices are remembered on networks you don't visit often.
 
 ---
 

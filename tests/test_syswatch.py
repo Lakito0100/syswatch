@@ -157,6 +157,7 @@ class _ArpTestBase(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         for name, value in (("KNOWN_DEVICES_PATH", os.path.join(self.tmp.name, "known.json")),
+                            ("TRUSTED_NETWORKS_PATH", os.path.join(self.tmp.name, "trusted.json")),
                             ("BASELINE_WINDOW", 0), ("INTRUDER_ALERTS", True)):
             p = mock.patch.object(sw, name, value)
             p.start()
@@ -222,7 +223,8 @@ class ArpThreadTests(_ArpTestBase):
     def test_unknown_network_with_no_baseline_flags_everything(self):
         self.run_cycles([{"aa": {"ip": "10.0.0.2", "iface": "eth0"}}])
         self.assertEqual(sw.get_state()["devices"]["aa"].status, "INTRUDER")
-        self.assertFalse(self.arp.current_network_known())
+        meta = sw.get_state()["network_meta"]
+        self.assertFalse(meta["trusted"])
 
     def test_last_seen_refreshes_are_not_written_every_cycle(self):
         table = {"aa": {"ip": "10.0.0.2", "iface": "eth0"}}
@@ -376,7 +378,8 @@ class RenderTests(unittest.TestCase):
                        "history": [{"timestamp": "2026-01-01T00:00:00", "status": "ok",
                                     "files_transferred": 3, "total_size_human": "1 GB",
                                     "duration_s": 5}, "junk", {"status": None}]},
-            "network_meta": {"net_id": "gw:x", "known": False, "scan_mode": "known"},
+            "network_meta": {"net_id": "gw:x", "trusted": False, "trustable": True,
+                             "cidrs": ["10.0.0.0/24"], "scan_mode": "trusted"},
         }
         hostile = {
             "system": None, "system_hist": None, "model": None, "devices": {},
@@ -385,11 +388,14 @@ class RenderTests(unittest.TestCase):
             "network_meta": None,
         }
         pi = dict(good, system=_fake_system_snap(is_pi=True),
-                  network_meta={"net_id": "gw:x", "known": True, "scan_mode": "known"})
+                  network_meta={"net_id": "gw:x", "trusted": True, "trustable": True,
+                                "cidrs": ["10.0.0.0/24"], "scan_mode": "trusted"})
+        never = dict(good, network_meta={"net_id": "net:10.0.0.0/24", "trusted": False,
+                                         "trustable": False, "cidrs": [], "scan_mode": "never"})
         half_hostile = dict(good, backup={"last_run": None}, services=[],
                             storage=dict(good["storage"], device=None, kind="mmc",
                                          card_type="SD", smart_health=None, io_reads=None))
-        return [good, hostile, pi, half_hostile]
+        return [good, hostile, pi, half_hostile, never]
 
     def test_every_tab_every_size(self):
         self._write_history()
@@ -402,6 +408,10 @@ class RenderTests(unittest.TestCase):
                         for scroll in (0, 3, 99):
                             renderer.render(tab, state, "m", "filter_input", "abc",
                                             window, scroll)
+                            renderer.render(tab, state, "", "confirm_scan", "",
+                                            window, scroll,
+                                            {"action": "trust", "net_id": "gw:aa:bb",
+                                             "cidrs": ["192.168.178.0/24"]})
                             # Cache keyed on file signature, so force reloads to
                             # exercise both paths.
                             renderer._hist_cache = None
@@ -457,7 +467,8 @@ class CliTests(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         report = json.loads(r.stdout)
         self.assertIn("/", report["disks"])
-        self.assertIn(report["scan_mode"], ("known", "always", "never"))
+        self.assertIn(report["scan_mode"], ("trusted", "never"))
+        self.assertIn("scan_network_trusted", report)
 
     def test_report_text_and_config_errors_on_stderr(self):
         cfg_path = os.path.join(self.tmp.name, "bad.toml")

@@ -217,7 +217,7 @@ prompt_for_config() {
     local j_storage_temp="$REPLY_JSON"
 
     ask network scan \
-        'Active ping sweep: "known" = only on networks you have trusted, true = always, false = never' \
+        'Active ping sweep: "trusted" = only on networks you explicitly confirm for scanning (press [s] on the NETWORK tab), "never" = never' \
         "$DEF_SCAN"
     local j_scan="$REPLY_JSON"
 

@@ -21,9 +21,11 @@ def default_path():
 
 # ── network identity ──────────────────────────────────────────────────────────
 
-def _read_gateway_mac():
+def default_gateway():
+    """(gateway_ip, gateway_mac) of the IPv4 default route; either may be
+    None (no default route, or the gateway isn't in the ARP table yet)."""
+    gw_ip = None
     try:
-        gw_ip = None
         with open("/proc/net/route") as f:
             next(f, None)
             for line in f:
@@ -35,18 +37,25 @@ def _read_gateway_mac():
                     octets = [gateway[i:i + 2] for i in (6, 4, 2, 0)]
                     gw_ip = ".".join(str(int(o, 16)) for o in octets)
                     break
-        if not gw_ip:
-            return None
+    except Exception:
+        return None, None
+    if not gw_ip:
+        return None, None
+    try:
         with open("/proc/net/arp") as f:
             for line in f.readlines()[1:]:
                 parts = line.split()
                 if len(parts) >= 4 and parts[0] == gw_ip:
                     mac = parts[3]
                     if mac and mac != "00:00:00:00:00:00":
-                        return mac.lower()
+                        return gw_ip, mac.lower()
     except Exception:
         pass
-    return None
+    return gw_ip, None
+
+
+def _read_gateway_mac():
+    return default_gateway()[1]
 
 
 def network_identity(local_networks=None):

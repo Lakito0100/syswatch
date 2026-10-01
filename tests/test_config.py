@@ -54,10 +54,8 @@ class FallbackParserTests(unittest.TestCase):
 
 class ValidationTests(unittest.TestCase):
     def test_scan_mode_vocabulary(self):
-        cases = {
-            "known": "known", "true": "always", "false": "never",
-            "always": "always", "never": "never", "KNOWN": "known",
-        }
+        cases = {"trusted": "trusted", "known": "trusted", "KNOWN": "trusted",
+                 "false": "never", "never": "never"}
         for raw, expected in cases.items():
             value, err = cfg.validate_raw("network", "scan", raw)
             self.assertIsNone(err, raw)
@@ -65,6 +63,18 @@ class ValidationTests(unittest.TestCase):
         value, err = cfg.validate_raw("network", "scan", "sometimes")
         self.assertIsNone(value)
         self.assertIn("network.scan", err)
+
+    def test_always_mode_is_gone(self):
+        # Typed at the installer prompt: rejected outright.
+        for raw in ("always", "true"):
+            value, err = cfg.validate_raw("network", "scan", raw)
+            self.assertIsNone(value, raw)
+            self.assertIn("removed", err)
+        # Found in a config file: reported, and downgraded to the safe mode.
+        for raw in (True, "always", "true"):
+            errors = []
+            self.assertEqual(cfg._v_scan_mode("network.scan", raw, errors), "trusted")
+            self.assertEqual(len(errors), 1)
 
     def test_threshold_pair_bare_and_bracketed(self):
         self.assertEqual(cfg.validate_raw("thresholds", "cpu_pct", "70, 80"), ((70.0, 80.0), None))
@@ -106,6 +116,14 @@ class LoadConfigTests(unittest.TestCase):
         self.assertEqual(conf["ui"]["refresh"], 1.0)
         self.assertEqual(len(errors), 1)
 
+    def test_old_scan_true_config_warns_and_stays_safe(self):
+        conf, errors = cfg.load_config(self._write("[network]\nscan = true\n"))
+        self.assertEqual(conf["network"]["scan"], "trusted")
+        self.assertTrue(any("removed" in e for e in errors), errors)
+
+    def test_default_scan_mode_is_trusted(self):
+        self.assertEqual(cfg.defaults()["network"]["scan"], "trusted")
+
     def test_invalid_values_fall_back_to_defaults(self):
         path = self._write(
             "[ui]\nrefresh = -3\ntop_n = 7\n"
@@ -129,7 +147,7 @@ class LoadConfigTests(unittest.TestCase):
     def test_write_default_config_refuses_overwrite_and_round_trips(self):
         path = os.path.join(self.tmp.name, "sub", "config.toml")
         overrides = {"thresholds": {"cpu_pct": (60.0, 85.5)},
-                     "network": {"scan": "always", "intruder_alerts": False},
+                     "network": {"scan": "never", "intruder_alerts": False},
                      "ui": {"refresh": 0.75, "default_tab": 2},
                      "logger": {"interval": 30, "retention_days": 7}}
         cfg.write_default_config(path, overrides=overrides)
@@ -138,7 +156,7 @@ class LoadConfigTests(unittest.TestCase):
         conf, errors = cfg.load_config(path)
         self.assertEqual(errors, [])
         self.assertEqual(conf["thresholds"]["cpu_pct"], (60.0, 85.5))
-        self.assertEqual(conf["network"]["scan"], "always")
+        self.assertEqual(conf["network"]["scan"], "never")
         self.assertIs(conf["network"]["intruder_alerts"], False)
         self.assertEqual(conf["ui"]["refresh"], 0.75)
         self.assertEqual(conf["ui"]["default_tab"], 2)

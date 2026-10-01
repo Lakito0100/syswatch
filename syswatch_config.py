@@ -89,7 +89,7 @@ _DEFAULT_THRESH = {
 }
 
 _DEFAULT_NETWORK = {
-    "scan":                          "known",
+    "scan":                          "trusted",
     "subnet":                        "192.168.1.0/24",
     "intruder_alerts":               True,
     "arp_refresh":                   2.0,
@@ -136,23 +136,37 @@ def _v_bool(path, v, errors):
     return v
 
 
+SCAN_MODES = ("trusted", "never")
+
+_ALWAYS_REMOVED = ("always-scan mode was removed for safety — syswatch now only "
+                   "scans networks you explicitly trusted ([s] on the NETWORK "
+                   "tab, or --trust-network); using \"trusted\"")
+
+
 def _v_scan_mode(path, v, errors):
-    # Normalizes to one of "known" / "always" / "never" — the same
-    # vocabulary --scan uses. Accepts real TOML booleans (true/false), the
-    # strings "known", "true", "false" so an existing `scan = true` or
-    # `scan = false` config keeps working exactly as before, and the
-    # --scan spellings "always"/"never" so the CLI vocabulary works too.
+    # Normalizes to "trusted" or "never" — the same vocabulary --scan uses.
+    #   "trusted" (and the old spelling "known") — sweep only networks the
+    #       user explicitly confirmed (see syswatch_trusted_networks.py)
+    #   false / "false" / "never" — never sweep
+    # The old unconditional mode (true / "true" / "always") no longer exists:
+    # sweeping a network that isn't yours can trip its intrusion detection,
+    # so nothing in a config file may enable scanning on its own. Such a
+    # value is reported and treated as "trusted" — the closest *safe* mode.
     if isinstance(v, bool):
-        return "always" if v else "never"
+        if v:
+            errors.append(f"{path}: {_ALWAYS_REMOVED}")
+            return "trusted"
+        return "never"
     if isinstance(v, str):
         lv = v.strip().lower()
-        if lv == "known":
-            return "known"
-        if lv in ("true", "always"):
-            return "always"
+        if lv in ("trusted", "known"):
+            return "trusted"
         if lv in ("false", "never"):
             return "never"
-    errors.append(f'{path}: expected "known", true, or false, got {v!r}')
+        if lv in ("true", "always"):
+            errors.append(f"{path}: {_ALWAYS_REMOVED}")
+            return "trusted"
+    errors.append(f'{path}: expected "trusted" or "never", got {v!r}')
     return None
 
 
@@ -432,7 +446,10 @@ def validate_raw(section, key, raw_text):
             parsed = text
     errors = []
     value = _SCHEMA[section][key](f"{section}.{key}", parsed, errors)
-    if value is None:
+    # A validator may accept a value *with* a warning (e.g. scan = "always",
+    # which load_config() downgrades to "trusted"); a hand-typed answer
+    # shouldn't be silently rewritten, so any message at all is a rejection.
+    if value is None or errors:
         return None, "; ".join(errors) if errors else f"{section}.{key}: invalid value"
     return value, None
 
@@ -502,11 +519,8 @@ def _fmt_thresh(default_pair, override):
 
 
 def _fmt_scan(override):
-    # validate_raw()/_v_scan_mode normalize to "known"/"always"/"never",
-    # but only "known" is itself valid *inside* a config file — "always"/
-    # "never" round-trip as the true/false spelling load_config() accepts.
-    mode = override if override is not None else "known"
-    return {"known": '"known"', "always": "true", "never": "false"}[mode]
+    mode = override if override is not None else "trusted"
+    return {"trusted": '"trusted"', "never": '"never"'}[mode]
 
 
 def _fmt_bool(v):
@@ -565,16 +579,16 @@ gpu_temp     = {gpu_temp}
 storage_temp = {storage_temp}
 
 [network]
-# scan controls the active ping sweep and takes three values:
-#   "known" (default) — sweep only if the current network is already in
-#                        known_devices.json; passive ARP reading everywhere
-#                        else. Press [t] on the NETWORK tab (or run
-#                        --trust-all-devices) to mark a network as known.
-#   true / "always"    — always sweep, regardless of whether the network
-#                        is known (the old unconditional behaviour)
-#   false / "never"    — never sweep; passive ARP reading only
+# scan controls the active ping sweep:
+#   "trusted" (default) — sweep only networks you explicitly trusted for
+#                         scanning: press [s] on the NETWORK tab and confirm
+#                         with [y] (or run --trust-network). Everywhere else
+#                         syswatch only reads the ARP table passively.
+#                         Trusting *devices* ([t]) never enables scanning.
+#   "never"             — never sweep; passive reading only, on every network
+# There is deliberately no "always" mode: an active sweep of a network that
+# isn't yours can trigger its security alerts.
 scan             = {scan}
-subnet           = "192.168.1.0/24"     # fallback CIDR swept when no local network is auto-detected
 intruder_alerts  = {intruder_alerts}                 # flag devices never seen on this network as INTRUDER
 arp_refresh      = 2.0                  # seconds between ARP table reads
 ping_cycle       = 420                  # seconds to sweep every host once

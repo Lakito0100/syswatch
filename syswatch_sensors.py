@@ -16,7 +16,7 @@ from datetime import datetime as _dt
 
 import psutil
 
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 
 # ── debug logging ─────────────────────────────────────────────────────────────
 # A shared, dependency-free error-tracking facility used by syswatch.py and
