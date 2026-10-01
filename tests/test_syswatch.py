@@ -13,6 +13,10 @@ from unittest import mock
 
 import helpers
 import syswatch as sw
+import syswatch_collectors as col
+import syswatch_network as net
+import syswatch_render as rnd
+import syswatch_state as st
 
 
 def _curses_patches(test):
@@ -31,38 +35,38 @@ def _curses_patches(test):
 
 class HelperFunctionTests(unittest.TestCase):
     def test_fmtb(self):
-        self.assertEqual(sw.fmtb(0), "0.0B")
-        self.assertEqual(sw.fmtb(1536), "1.5KB")
-        self.assertEqual(sw.fmtb(1024 ** 5 * 3), "3.0PB")
+        self.assertEqual(rnd.fmtb(0), "0.0B")
+        self.assertEqual(rnd.fmtb(1536), "1.5KB")
+        self.assertEqual(rnd.fmtb(1024 ** 5 * 3), "3.0PB")
 
     def test_fmtup(self):
-        self.assertEqual(sw.fmtup(59), "00:00:59")
-        self.assertEqual(sw.fmtup(86400 + 3661), "1d 01:01:01")
+        self.assertEqual(rnd.fmtup(59), "00:00:59")
+        self.assertEqual(rnd.fmtup(86400 + 3661), "1d 01:01:01")
 
     def test_sparkline_edge_cases(self):
-        self.assertEqual(sw.sparkline([], 4), "    ")
-        self.assertEqual(sw.sparkline([1, 2], 0), "")
-        self.assertEqual(sw.sparkline([-5, -1], 2), "  ")  # all-negative never indexes out of range
-        self.assertEqual(sw.sparkline([0, 50, 100], 3), " ▄█")
-        self.assertEqual(len(sw.sparkline(range(100), 10)), 10)
+        self.assertEqual(rnd.sparkline([], 4), "    ")
+        self.assertEqual(rnd.sparkline([1, 2], 0), "")
+        self.assertEqual(rnd.sparkline([-5, -1], 2), "  ")  # all-negative never indexes out of range
+        self.assertEqual(rnd.sparkline([0, 50, 100], 3), " ▄█")
+        self.assertEqual(len(rnd.sparkline(range(100), 10)), 10)
 
     def test_device_status(self):
         now = time.time()
-        dev = sw.DeviceInfo("1.2.3.4", "aa", "h", now, now, "Active")
-        self.assertEqual(sw._device_status(dev), "Active")
+        dev = st.DeviceInfo("1.2.3.4", "aa", "h", now, now, "Active")
+        self.assertEqual(st._device_status(dev), "Active")
         dev.last_seen = now - 60
-        self.assertEqual(sw._device_status(dev), "Recent")
+        self.assertEqual(st._device_status(dev), "Recent")
         dev.last_seen = now - 400
-        self.assertEqual(sw._device_status(dev), "Idle")
+        self.assertEqual(st._device_status(dev), "Idle")
         dev.status, dev.last_seen = "INTRUDER", now - 10
-        self.assertEqual(sw._device_status(dev), "INTRUDER")
-        dev.last_seen = now - sw.INTRUDER_TTL - 1
-        self.assertEqual(sw._device_status(dev), "Idle")
+        self.assertEqual(st._device_status(dev), "INTRUDER")
+        dev.last_seen = now - st.settings.INTRUDER_TTL - 1
+        self.assertEqual(st._device_status(dev), "Idle")
 
 
 class FsStatsTests(unittest.TestCase):
     def test_matches_df_and_psutil(self):
-        fs = sw.StorageThread._fs_stats("/")
+        fs = col.StorageThread._fs_stats("/")
         du = sw.psutil.disk_usage("/")
         self.assertEqual(fs["total"], du.total)
         self.assertAlmostEqual(fs["pct"], du.percent, delta=0.2)
@@ -71,7 +75,7 @@ class FsStatsTests(unittest.TestCase):
         St = collections.namedtuple("St", "f_blocks f_bfree f_bavail f_frsize")
         # 1000 blocks, 600 free of which only 550 available to non-root.
         with mock.patch.object(sw.os, "statvfs", return_value=St(1000, 600, 550, 4096)):
-            fs = sw.StorageThread._fs_stats("/")
+            fs = col.StorageThread._fs_stats("/")
         self.assertEqual(fs["used"], 400 * 4096)
         self.assertAlmostEqual(fs["pct"], 400 / 950 * 100)
 
@@ -79,10 +83,10 @@ class FsStatsTests(unittest.TestCase):
 class SmartTests(unittest.TestCase):
     def _smart(self, payload, kind="disk"):
         done = subprocess.CompletedProcess([], 0, stdout=json.dumps(payload), stderr="")
-        with mock.patch.object(sw.shutil, "which", return_value="/usr/sbin/smartctl"), \
-                mock.patch.object(sw.subprocess, "run", return_value=done), \
-                mock.patch.object(sw, "_note") as note:
-            result = sw.StorageThread._smart("sda", kind)
+        with mock.patch.object(net.shutil, "which", return_value="/usr/sbin/smartctl"), \
+                mock.patch.object(net.subprocess, "run", return_value=done), \
+                mock.patch.object(col, "_note") as note:
+            result = col.StorageThread._smart("sda", kind)
         return result, note
 
     def test_ata(self):
@@ -113,21 +117,21 @@ class SmartTests(unittest.TestCase):
 
 class LogParseTests(unittest.TestCase):
     def test_parse_line_variants(self):
-        lt = sw.LogThread()
+        lt = col.LogThread()
         entry = lt._parse_line(json.dumps({
             "PRIORITY": "3", "_SYSTEMD_UNIT": "ssh.service", "MESSAGE": "boom",
             "__REALTIME_TIMESTAMP": "1700000000000000"}).encode())
         self.assertEqual((entry["priority"], entry["unit"], entry["message"]), (3, "ssh", "boom"))
         binary = lt._parse_line(json.dumps({"MESSAGE": [104, 105], "SYSLOG_IDENTIFIER": "k"}).encode())
         self.assertEqual(binary["message"], "<binary>")
-        with mock.patch.object(sw, "_note"):
+        with mock.patch.object(col, "_note"):
             self.assertIsNone(lt._parse_line(b"not json"))
 
 
 class HostnameTests(unittest.TestCase):
     def setUp(self):
-        sw._hostname_cache.clear()
-        self.addCleanup(sw._hostname_cache.clear)
+        net._hostname_cache.clear()
+        self.addCleanup(net._hostname_cache.clear)
 
     def test_slow_resolver_is_bounded(self):
         release = threading.Event()
@@ -137,18 +141,18 @@ class HostnameTests(unittest.TestCase):
             return ("late.example", "0")
 
         self.addCleanup(release.set)
-        with mock.patch.object(sw.socket, "getnameinfo", side_effect=slow), \
-                mock.patch.object(sw, "_HOSTNAME_TIMEOUT", 0.2):
+        with mock.patch.object(net.socket, "getnameinfo", side_effect=slow), \
+                mock.patch.object(net, "_HOSTNAME_TIMEOUT", 0.2):
             t0 = time.monotonic()
-            self.assertEqual(sw._resolve_hostname("10.9.9.9"), "10.9.9.9")
+            self.assertEqual(net._resolve_hostname("10.9.9.9"), "10.9.9.9")
             self.assertLess(time.monotonic() - t0, 1.5)
         # Cached with the short retry TTL, not the hour-long one.
-        self.assertEqual(sw._hostname_cache["10.9.9.9"][2], sw._HOSTNAME_RETRY_AFTER)
+        self.assertEqual(net._hostname_cache["10.9.9.9"][2], net._HOSTNAME_RETRY_AFTER)
 
     def test_resolves_and_caches(self):
-        with mock.patch.object(sw.socket, "getnameinfo", return_value=("nas.lan", "0")) as gni:
-            self.assertEqual(sw._resolve_hostname("10.0.0.5"), "nas.lan")
-            self.assertEqual(sw._resolve_hostname("10.0.0.5"), "nas.lan")
+        with mock.patch.object(net.socket, "getnameinfo", return_value=("nas.lan", "0")) as gni:
+            self.assertEqual(net._resolve_hostname("10.0.0.5"), "nas.lan")
+            self.assertEqual(net._resolve_hostname("10.0.0.5"), "nas.lan")
         self.assertEqual(gni.call_count, 1)
 
 
@@ -159,20 +163,20 @@ class _ArpTestBase(unittest.TestCase):
         for name, value in (("KNOWN_DEVICES_PATH", os.path.join(self.tmp.name, "known.json")),
                             ("TRUSTED_NETWORKS_PATH", os.path.join(self.tmp.name, "trusted.json")),
                             ("BASELINE_WINDOW", 0), ("INTRUDER_ALERTS", True)):
-            p = mock.patch.object(sw, name, value)
+            p = mock.patch.object(st.settings, name, value)
             p.start()
             self.addCleanup(p.stop)
-        with sw._state_lock:
-            sw._state["devices"] = {}
-        self.addCleanup(lambda: sw._state.__setitem__("devices", {}))
-        self.arp = sw.ARPPassiveThread()
+        with st._state_lock:
+            st._state["devices"] = {}
+        self.addCleanup(lambda: st._state.__setitem__("devices", {}))
+        self.arp = net.ARPPassiveThread()
         p = mock.patch.object(sw.sensors, "local_networks", return_value=[])
         p.start()
         self.addCleanup(p.stop)
         p = mock.patch.object(sw.known_devices, "network_identity", return_value="net:test")
         p.start()
         self.addCleanup(p.stop)
-        p = mock.patch.object(sw, "_resolve_hostname", side_effect=lambda ip: ip)
+        p = mock.patch.object(net, "_resolve_hostname", side_effect=lambda ip: ip)
         p.start()
         self.addCleanup(p.stop)
 
@@ -187,7 +191,7 @@ class _ArpTestBase(unittest.TestCase):
             return dict(last)
 
         self.arp._parse_arp_table = parse
-        with mock.patch.object(sw, "ARP_REFRESH", interval):
+        with mock.patch.object(st.settings, "ARP_REFRESH", interval):
             self.arp.start()
             time.sleep(interval * (len(tables) + 5) + 0.3)
             self.arp.stop()
@@ -198,83 +202,83 @@ class _ArpTestBase(unittest.TestCase):
 class ArpThreadTests(_ArpTestBase):
     def test_new_device_on_known_network_is_intruder_and_trust_clears_it(self):
         sw.known_devices.save({"net:test": {"aa": {"first_seen": 1, "last_seen": time.time(),
-                                                   "hostname": "a"}}}, sw.KNOWN_DEVICES_PATH)
-        self.arp._known = sw.known_devices.load(sw.KNOWN_DEVICES_PATH)
+                                                   "hostname": "a"}}}, st.settings.KNOWN_DEVICES_PATH)
+        self.arp._known = sw.known_devices.load(st.settings.KNOWN_DEVICES_PATH)
         table = {"aa": {"ip": "10.0.0.2", "iface": "eth0"},
                  "bb": {"ip": "10.0.0.3", "iface": "eth0"}}
         self.run_cycles([table])
-        devs = sw.get_state()["devices"]
+        devs = st.get_state()["devices"]
         self.assertEqual(devs["aa"].status, "Active")
         self.assertEqual(devs["bb"].status, "INTRUDER")
         self.arp.trust_all()
-        self.assertEqual(sw.get_state()["devices"]["bb"].status, "Active")
-        saved = sw.known_devices.load(sw.KNOWN_DEVICES_PATH)
+        self.assertEqual(st.get_state()["devices"]["bb"].status, "Active")
+        saved = sw.known_devices.load(st.settings.KNOWN_DEVICES_PATH)
         self.assertIn("bb", saved["net:test"])
         self.assertEqual(saved["net:test"]["aa"]["hostname"], "a")  # not clobbered with the IP
 
     def test_departed_device_ages_out_of_active(self):
         table = {"aa": {"ip": "10.0.0.2", "iface": "eth0"}}
-        with sw._state_lock:
-            sw._state["devices"]["gone"] = sw.DeviceInfo(
+        with st._state_lock:
+            st._state["devices"]["gone"] = st.DeviceInfo(
                 "10.0.0.9", "gone", "x", 0, time.time() - 1000, "Active")
         self.run_cycles([table])
-        self.assertEqual(sw.get_state()["devices"]["gone"].status, "Idle")
+        self.assertEqual(st.get_state()["devices"]["gone"].status, "Idle")
 
     def test_unknown_network_with_no_baseline_flags_everything(self):
         self.run_cycles([{"aa": {"ip": "10.0.0.2", "iface": "eth0"}}])
-        self.assertEqual(sw.get_state()["devices"]["aa"].status, "INTRUDER")
-        meta = sw.get_state()["network_meta"]
+        self.assertEqual(st.get_state()["devices"]["aa"].status, "INTRUDER")
+        meta = st.get_state()["network_meta"]
         self.assertFalse(meta["trusted"])
 
     def test_last_seen_refreshes_are_not_written_every_cycle(self):
         table = {"aa": {"ip": "10.0.0.2", "iface": "eth0"}}
-        with mock.patch.object(sw, "BASELINE_WINDOW", 60), \
+        with mock.patch.object(st.settings, "BASELINE_WINDOW", 60), \
                 mock.patch.object(sw.known_devices, "save", wraps=sw.known_devices.save) as save:
             self.run_cycles([table] * 20)
         # One save for learning the new device, one final flush at shutdown —
         # not one per cycle.
         self.assertLessEqual(save.call_count, 3, save.call_count)
-        self.assertIn("aa", sw.known_devices.load(sw.KNOWN_DEVICES_PATH)["net:test"])
+        self.assertIn("aa", sw.known_devices.load(st.settings.KNOWN_DEVICES_PATH)["net:test"])
 
 
 class GetStateTests(unittest.TestCase):
     def test_snapshot_is_independent(self):
-        with sw._state_lock:
-            sw._state["devices"] = {"aa": sw.DeviceInfo("1.1.1.1", "aa", "h", 0, 0, "Active")}
-        self.addCleanup(lambda: sw._state.__setitem__("devices", {}))
-        snap = sw.get_state()
-        with sw._state_lock:
-            sw._state["devices"]["aa"].status = "Idle"
-            sw._state["devices"]["bb"] = None
+        with st._state_lock:
+            st._state["devices"] = {"aa": st.DeviceInfo("1.1.1.1", "aa", "h", 0, 0, "Active")}
+        self.addCleanup(lambda: st._state.__setitem__("devices", {}))
+        snap = st.get_state()
+        with st._state_lock:
+            st._state["devices"]["aa"].status = "Idle"
+            st._state["devices"]["bb"] = None
         self.assertEqual(snap["devices"]["aa"].status, "Active")
         self.assertNotIn("bb", snap["devices"])
 
 
 class SystemThreadTests(unittest.TestCase):
     def test_collection_does_not_hold_the_state_lock(self):
-        m = sw.Metrics()
+        m = col.Metrics()
         real_top = m._top_procs
         held = []
 
         def probe():
             # If collect() ran under _state_lock this acquire would fail.
-            ok = sw._state_lock.acquire(blocking=False)
+            ok = st._state_lock.acquire(blocking=False)
             if ok:
-                sw._state_lock.release()
+                st._state_lock.release()
             held.append(not ok)
             return real_top()
 
         m._top_procs = probe
-        t = sw.SystemThread()
+        t = col.SystemThread()
         t._metrics = m
-        with mock.patch.object(sw, "THRESH", {"cpu_temp": (70, 80)}):
+        with mock.patch.object(st.settings, "THRESH", {"cpu_temp": (70, 80)}):
             t.start()
             time.sleep(0.5)
             t.stop()
             t.join(3)
         self.assertTrue(held)
         self.assertFalse(any(held))
-        state = sw.get_state()
+        state = st.get_state()
         self.assertIsNotNone(state["system"])
         self.assertGreaterEqual(len(state["system_hist"]["cpu"]), 1)
 
@@ -316,12 +320,12 @@ class RenderTests(unittest.TestCase):
                               side_effect=lambda *parts: os.path.join(self.tmp.name, *parts))
         p.start()
         self.addCleanup(p.stop)
-        p = mock.patch.object(sw, "THRESH", {k: v for k, v in (
+        p = mock.patch.object(st.settings, "THRESH", {k: v for k, v in (
             ("cpu_pct", (80, 95)), ("ram_pct", (75, 90)), ("cpu_temp", (70, 80)),
             ("disk_pct", (85, 95)), ("gpu_temp", (85, 95)), ("storage_temp", (65, 75)))})
         p.start()
         self.addCleanup(p.stop)
-        p = mock.patch.object(sw, "WATCHED_SERVICES", ["ssh", "systemd-networkd-wait-online"])
+        p = mock.patch.object(st.settings, "WATCHED_SERVICES", ["ssh", "systemd-networkd-wait-online"])
         p.start()
         self.addCleanup(p.stop)
         self.tabs = [("system", "SYSTEM"), ("network", "NETWORK"), ("logs", "LOGS"),
@@ -343,9 +347,9 @@ class RenderTests(unittest.TestCase):
     def _states(self):
         now = time.time()
         devices = {
-            "aa:aa:aa:aa:aa:aa": sw.DeviceInfo("192.168.100.200", "aa:aa:aa:aa:aa:aa",
+            "aa:aa:aa:aa:aa:aa": st.DeviceInfo("192.168.100.200", "aa:aa:aa:aa:aa:aa",
                                                "very-long-hostname." * 5, now, now, "INTRUDER"),
-            "bb:bb:bb:bb:bb:bb": sw.DeviceInfo("10.0.0.2", "bb:bb:bb:bb:bb:bb",
+            "bb:bb:bb:bb:bb:bb": st.DeviceInfo("10.0.0.2", "bb:bb:bb:bb:bb:bb",
                                                "10.0.0.2", now - 9000, now - 9000, "Idle"),
         }
         good = {
@@ -401,7 +405,7 @@ class RenderTests(unittest.TestCase):
         self._write_history()
         for h, w in self.SIZES:
             win = helpers.FakeWin(h, w)
-            renderer = sw.FullRenderer(win, self.tabs)
+            renderer = rnd.FullRenderer(win, self.tabs)
             for state in self._states():
                 for tab in range(1, len(self.tabs) + 1):
                     for window in range(5):
@@ -420,7 +424,7 @@ class RenderTests(unittest.TestCase):
     def test_history_renders_charts_and_gap_markers(self):
         self._write_history()
         win = helpers.FakeWin(60, 160)
-        renderer = sw.FullRenderer(win, self.tabs)
+        renderer = rnd.FullRenderer(win, self.tabs)
         renderer.render(7, self._states()[0], "", "normal", "", 2, 0)
         text = win.text()
         self.assertIn("CPU %", text)
@@ -428,7 +432,7 @@ class RenderTests(unittest.TestCase):
 
     def test_services_columns_stay_aligned(self):
         win = helpers.FakeWin(24, 120)
-        renderer = sw.FullRenderer(win, self.tabs)
+        renderer = rnd.FullRenderer(win, self.tabs)
         renderer.render(4, self._states()[0], "", "normal", "", 0, 0)
         lines = win.text().splitlines()
         row = next(ln for ln in lines if ln.startswith("systemd-network"))
@@ -437,7 +441,7 @@ class RenderTests(unittest.TestCase):
 
     def test_history_cache_reloads_only_on_change(self):
         self._write_history()
-        renderer = sw.FullRenderer(helpers.FakeWin(24, 80), self.tabs)
+        renderer = rnd.FullRenderer(helpers.FakeWin(24, 80), self.tabs)
         first = renderer._load_history()
         renderer._hist_cache = (0.0,) + renderer._hist_cache[1:]  # expire the TTL
         with mock.patch("builtins.open", side_effect=AssertionError("re-parsed")):
@@ -542,7 +546,7 @@ class NeighbourStateTests(unittest.TestCase):
     ])
 
     def test_states(self):
-        arp = sw.ARPPassiveThread.__new__(sw.ARPPassiveThread)
+        arp = net.ARPPassiveThread.__new__(net.ARPPassiveThread)
         parsed = arp._parse_neigh_json(self.SAMPLE)
         self.assertEqual(set(parsed), {"aa:aa:aa:aa:aa:01", "aa:aa:aa:aa:aa:02", "aa:aa:aa:aa:aa:05"})
         self.assertTrue(parsed["aa:aa:aa:aa:aa:01"]["fresh"])
@@ -550,11 +554,11 @@ class NeighbourStateTests(unittest.TestCase):
         self.assertTrue(parsed["aa:aa:aa:aa:aa:05"]["fresh"])
 
     def test_falls_back_to_proc_when_ip_is_missing_or_too_old(self):
-        arp = sw.ARPPassiveThread.__new__(sw.ARPPassiveThread)
+        arp = net.ARPPassiveThread.__new__(net.ARPPassiveThread)
         arp._ip_json = None
         old_ip = subprocess.CompletedProcess([], 255, stdout="", stderr='Option "-j" is unknown')
-        with mock.patch.object(sw.shutil, "which", return_value="/sbin/ip"), \
-                mock.patch.object(sw.subprocess, "run", return_value=old_ip), \
+        with mock.patch.object(net.shutil, "which", return_value="/sbin/ip"), \
+                mock.patch.object(net.subprocess, "run", return_value=old_ip), \
                 mock.patch.object(arp, "_parse_proc_arp", return_value={"x": 1}) as proc:
             self.assertEqual(arp._parse_arp_table(), {"x": 1})
             self.assertIs(arp._ip_json, False)
@@ -564,22 +568,22 @@ class NeighbourStateTests(unittest.TestCase):
     def test_stale_entry_does_not_refresh_last_seen(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
-        with mock.patch.object(sw, "KNOWN_DEVICES_PATH", os.path.join(tmp.name, "k.json")), \
-                mock.patch.object(sw, "TRUSTED_NETWORKS_PATH", os.path.join(tmp.name, "t.json")), \
-                mock.patch.object(sw, "current_network", return_value=("gw:aa", [])), \
-                mock.patch.object(sw, "_resolve_hostname", side_effect=lambda ip: ip), \
-                mock.patch.object(sw, "ARP_REFRESH", 0.02):
-            with sw._state_lock:
-                sw._state["devices"] = {"m": sw.DeviceInfo("10.0.0.2", "m", "h", 0, time.time() - 3000, "Active")}
-            self.addCleanup(lambda: sw._state.__setitem__("devices", {}))
-            arp = sw.ARPPassiveThread()
+        with mock.patch.object(st.settings, "KNOWN_DEVICES_PATH", os.path.join(tmp.name, "k.json")), \
+                mock.patch.object(st.settings, "TRUSTED_NETWORKS_PATH", os.path.join(tmp.name, "t.json")), \
+                mock.patch.object(net, "current_network", return_value=("gw:aa", [])), \
+                mock.patch.object(net, "_resolve_hostname", side_effect=lambda ip: ip), \
+                mock.patch.object(st.settings, "ARP_REFRESH", 0.02):
+            with st._state_lock:
+                st._state["devices"] = {"m": st.DeviceInfo("10.0.0.2", "m", "h", 0, time.time() - 3000, "Active")}
+            self.addCleanup(lambda: st._state.__setitem__("devices", {}))
+            arp = net.ARPPassiveThread()
             arp._parse_arp_table = lambda: {"m": {"ip": "10.0.0.2", "iface": "eth0", "fresh": False}}
             arp._net_id = "gw:aa"  # same network: don't clear the list
             arp.start()
             time.sleep(0.2)
             arp.stop()
             arp.join(2)
-        dev = sw.get_state()["devices"]["m"]
+        dev = st.get_state()["devices"]["m"]
         self.assertLess(dev.last_seen, time.time() - 2000)
         self.assertEqual(dev.status, "Idle")
 
@@ -611,9 +615,9 @@ class HistoryIntervalTests(unittest.TestCase):
     def test_median_interval(self):
         t0 = datetime(2026, 1, 1)
         ts = [t0 + timedelta(seconds=s) for s in (0, 120, 240, 360, 2000)]
-        self.assertEqual(sw.FullRenderer._median_interval(ts), 120)
-        self.assertEqual(sw.FullRenderer._median_interval(ts[:2]), 120.0)
-        self.assertEqual(sw.FullRenderer._median_interval([t0, t0, t0]), 1.0)
+        self.assertEqual(rnd.FullRenderer._median_interval(ts), 120)
+        self.assertEqual(rnd.FullRenderer._median_interval(ts[:2]), 120.0)
+        self.assertEqual(rnd.FullRenderer._median_interval([t0, t0, t0]), 1.0)
 
     def test_sparse_metric_has_no_false_gaps(self):
         _curses_patches(self)
@@ -627,9 +631,9 @@ class HistoryIntervalTests(unittest.TestCase):
                 f.write(f"{t:%Y-%m-%dT%H:%M:%S},10,20,{temp},30\n")
         with mock.patch.object(sw.sensors, "user_data_path",
                                side_effect=lambda *p: os.path.join(tmp.name, *p)), \
-                mock.patch.object(sw, "THRESH", {}):
+                mock.patch.object(st.settings, "THRESH", {}):
             win = helpers.FakeWin(80, 120)
-            sw.FullRenderer(win, [("history", "HISTORY")]).render(1, {}, "", "normal", "", 1, 2)
+            rnd.FullRenderer(win, [("history", "HISTORY")]).render(1, {}, "", "normal", "", 1, 2)
         text = win.text()
         self.assertIn("TEMP °C", text)
         self.assertNotIn("┊", text)

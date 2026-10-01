@@ -12,6 +12,8 @@ from unittest import mock
 
 import helpers
 import syswatch as sw
+import syswatch_network as net
+import syswatch_state as st
 import syswatch_trusted_networks as tn
 
 GW = "gw:aa:bb:cc:dd:ee:ff"
@@ -70,24 +72,24 @@ class _TrustBase(unittest.TestCase):
         for name, value in (("KNOWN_DEVICES_PATH", os.path.join(self.tmp.name, "known.json")),
                             ("TRUSTED_NETWORKS_PATH", self.trust_path),
                             ("SCAN_MODE", "trusted"), ("BASELINE_WINDOW", 60)):
-            p = mock.patch.object(sw, name, value)
+            p = mock.patch.object(st.settings, name, value)
             p.start()
             self.addCleanup(p.stop)
-        sw._alerts.clear()
-        self.addCleanup(sw._alerts.clear)
+        st._alerts.clear()
+        self.addCleanup(st._alerts.clear)
         self.network = (GW, [CIDR])
-        self.trust = sw.NetworkTrust()
+        self.trust = net.NetworkTrust()
 
     def net(self):
         return self.network
 
     def alerts(self):
-        return [a[1] for a in sw._alerts]
+        return [a[1] for a in st._alerts]
 
 
 class ScanTrustDialogTests(_TrustBase):
     def dialog(self, on_change=None):
-        return sw.ScanTrustDialog(self.trust, network_fn=self.net, on_change=on_change)
+        return net.ScanTrustDialog(self.trust, network_fn=self.net, on_change=on_change)
 
     def test_only_y_confirms(self):
         for key in ("n", "N", "\x1b", "\n", " ", "q", "t", "s"):
@@ -154,7 +156,7 @@ class ScanTrustDialogTests(_TrustBase):
             self.assertIsNone(d.pending)
 
     def test_scan_never_refuses(self):
-        with mock.patch.object(sw, "SCAN_MODE", "never"):
+        with mock.patch.object(st.settings, "SCAN_MODE", "never"):
             self.assertFalse(self.dialog().open())
 
     def test_untrust_flow(self):
@@ -167,7 +169,7 @@ class ScanTrustDialogTests(_TrustBase):
         d.open()
         d.handle_key(ord("y"))
         self.assertFalse(self.trust.is_trusted(GW))
-        self.assertFalse(sw.NetworkTrust().is_trusted(GW))
+        self.assertFalse(net.NetworkTrust().is_trusted(GW))
 
 
 class PingSweepGateTests(_TrustBase):
@@ -191,16 +193,16 @@ class PingSweepGateTests(_TrustBase):
             self.pinged.append(cmd[-1])
             return FakeProc()
 
-        p1 = mock.patch.object(sw.subprocess, "Popen", side_effect=popen)
-        p2 = mock.patch.object(sw, "PING_CYCLE", 0.2)
-        p3 = mock.patch.object(sw, "PING_BATCH", 64)
-        p4 = mock.patch.object(sw.shutil, "which", side_effect=lambda b: f"/usr/bin/{b}")
+        p1 = mock.patch.object(net.subprocess, "Popen", side_effect=popen)
+        p2 = mock.patch.object(st.settings, "PING_CYCLE", 0.2)
+        p3 = mock.patch.object(st.settings, "PING_BATCH", 64)
+        p4 = mock.patch.object(net.shutil, "which", side_effect=lambda b: f"/usr/bin/{b}")
         for p in (p1, p2, p3, p4):
             p.start()
             self.addCleanup(p.stop)
 
     def sweep(self, seconds=0.6, scan_mode="trusted", network_fn=None):
-        t = sw.PingSweepThread(scan_mode=scan_mode, trust=self.trust,
+        t = net.PingSweepThread(scan_mode=scan_mode, trust=self.trust,
                                network_fn=network_fn or self.net)
         t._GATED_POLL = 0.05
         t.start()
@@ -244,7 +246,7 @@ class PingSweepGateTests(_TrustBase):
             calls["n"] += 1
             return (GW, [CIDR]) if calls["n"] <= 2 else (OTHER_GW, [CIDR])
 
-        with mock.patch.object(sw, "PING_BATCH", 10):
+        with mock.patch.object(st.settings, "PING_BATCH", 10):
             self.sweep(network_fn=flaky)
         # Gate + first batch allowed, then the identity changed: at most one batch.
         self.assertLessEqual(len(self.pinged), 10)
@@ -259,43 +261,43 @@ class PingSweepGateTests(_TrustBase):
 class DeviceTrustNeverEnablesScanningTests(_TrustBase):
     def setUp(self):
         super().setUp()
-        with sw._state_lock:
-            sw._state["devices"] = {}
-        self.addCleanup(lambda: sw._state.__setitem__("devices", {}))
-        p = mock.patch.object(sw, "current_network", side_effect=lambda: self.network)
+        with st._state_lock:
+            st._state["devices"] = {}
+        self.addCleanup(lambda: st._state.__setitem__("devices", {}))
+        p = mock.patch.object(net, "current_network", side_effect=lambda: self.network)
         p.start()
         self.addCleanup(p.stop)
-        p = mock.patch.object(sw, "_resolve_hostname", side_effect=lambda ip: ip)
+        p = mock.patch.object(net, "_resolve_hostname", side_effect=lambda ip: ip)
         p.start()
         self.addCleanup(p.stop)
 
     def test_t_and_baseline_learning_do_not_trust_the_network(self):
-        arp = sw.ARPPassiveThread(trust=self.trust)
+        arp = net.ARPPassiveThread(trust=self.trust)
         arp._parse_arp_table = lambda: {"aa": {"ip": "192.168.178.2", "iface": "eth0"}}
-        with mock.patch.object(sw, "ARP_REFRESH", 0.02):
+        with mock.patch.object(st.settings, "ARP_REFRESH", 0.02):
             arp.start()
             time.sleep(0.3)
             arp.trust_all()
             time.sleep(0.1)
             arp.stop()
             arp.join(2)
-        self.assertIn("aa", sw.known_devices.load(sw.KNOWN_DEVICES_PATH)[GW])
+        self.assertIn("aa", sw.known_devices.load(st.settings.KNOWN_DEVICES_PATH)[GW])
         self.assertFalse(self.trust.is_trusted(GW))
         self.assertFalse(os.path.exists(self.trust_path))
-        self.assertFalse(sw.get_state()["network_meta"]["trusted"])
+        self.assertFalse(st.get_state()["network_meta"]["trusted"])
         # Next run on the same network: devices known, still not scannable.
-        self.assertFalse(sw.NetworkTrust().is_trusted(GW))
+        self.assertFalse(net.NetworkTrust().is_trusted(GW))
 
     def test_network_change_clears_the_device_list(self):
-        arp = sw.ARPPassiveThread(trust=self.trust)
+        arp = net.ARPPassiveThread(trust=self.trust)
         arp._refresh_network_identity(time.time())
-        with sw._state_lock:
-            sw._state["devices"]["old"] = sw.DeviceInfo("1.1.1.1", "old", "x", 0, 0, "Active")
+        with st._state_lock:
+            st._state["devices"]["old"] = st.DeviceInfo("1.1.1.1", "old", "x", 0, 0, "Active")
         arp._refresh_network_identity(time.time())
-        self.assertIn("old", sw.get_state()["devices"])
+        self.assertIn("old", st.get_state()["devices"])
         self.network = (OTHER_GW, [CIDR])
         arp._refresh_network_identity(time.time())
-        self.assertEqual(sw.get_state()["devices"], {})
+        self.assertEqual(st.get_state()["devices"], {})
 
 
 class CliTrustTests(unittest.TestCase):
@@ -352,7 +354,7 @@ class CliTrustTests(unittest.TestCase):
         return os.waitstatus_to_exitcode(status), out.decode(errors="replace")
 
     def _require_trustable_network(self):
-        net_id, cidrs = sw.current_network()
+        net_id, cidrs = net.current_network()
         if not (tn.trustable(net_id) and cidrs):
             self.skipTest("this machine's network has no identifiable gateway/subnet")
         return net_id
