@@ -22,27 +22,28 @@ from datetime import datetime as _dt
 
 
 def _bootstrap():
+    # psutil is the one third-party dependency. It used to be pip-installed
+    # here on first run — under `sudo` that meant pip writing into the system
+    # Python with --break-system-packages, which can break apt-managed
+    # packages. Now it's installed by install-syswatch.sh (apt's
+    # python3-psutil); if it's missing, say how to get it and stop.
     import importlib.util as ilu
-    missing = [p for p in ("psutil", "asciichartpy") if ilu.find_spec(p) is None]
-    if missing:
-        print(f"Installing: {', '.join(missing)} …")
-        try:
-            subprocess.check_call(
-                [sys.executable, "-m", "pip", "install", "--quiet"] + missing)
-        except subprocess.CalledProcessError:
-            subprocess.check_call(
-                [sys.executable, "-m", "pip", "install", "--quiet",
-                 "--break-system-packages"] + missing)
+    if ilu.find_spec("psutil") is None:
+        sys.stderr.write(
+            "syswatch needs the psutil Python module, which isn't installed.\n"
+            "Install it with:  sudo apt install python3-psutil\n"
+            "(or re-run install-syswatch.sh, which does this for you).\n")
+        sys.exit(1)
 
 _bootstrap()
 import psutil
-import asciichartpy
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import syswatch_sensors as sensors
 import syswatch_config
 import syswatch_known_devices as known_devices
 import syswatch_trusted_networks as trusted_networks
+import syswatch_asciichart as asciichartpy  # vendored, see the file header
 
 # A thread whose run() loop somehow lets an exception escape its own
 # try/except would otherwise just die silently — no crash, no signal, the
@@ -627,19 +628,9 @@ class SystemThread(threading.Thread):
         self._temp_alert_level  = 0  # 0=ok, 1=warning, 2=critical
 
     def _write_temp_alert(self, msg):
-        try:
-            # Sudo-aware so a `sudo syswatch` run appends to the same alert
-            # history as an unprivileged one instead of starting a second copy
-            # under /root that the user never sees.
-            log_path = sensors.user_data_path("temp_alerts.log")
-            log_dir  = os.path.dirname(log_path)
-            os.makedirs(log_dir, exist_ok=True)
-            ts = _dt.now().strftime("%Y-%m-%d %H:%M:%S")
-            with open(log_path, "a") as f:
-                f.write(f"{ts} {msg}\n")
-            sensors.chown_to_invoking_user(log_dir, log_path)
-        except Exception as e:
-            _note("SystemThread._write_temp_alert", e)
+        # Shared with syswatch-logger; only one of them writes the file —
+        # see sensors.append_alert.
+        sensors.append_alert("temp_alerts.log", msg)
 
     def _check_temp_alert(self, snap):
         ct = snap.get("cpu_temp")
@@ -699,6 +690,7 @@ class ARPPassiveThread(threading.Thread):
         self._net_id        = None
         self._net_cidrs     = []
         self._net_seen      = False  # was self._net_id already in the allowlist when detected
+        self._ip_json       = None   # None = untried, True = works, False = unusable
         self._baseline_until = 0.0
         self._dirty          = False  # unsaved change of any kind
         self._dirty_new      = False  # ...that adds a MAC (saved promptly)
@@ -718,7 +710,37 @@ class ARPPassiveThread(threading.Thread):
     # batched to this interval; anything that adds a device saves immediately.
     _LAST_SEEN_SAVE_INTERVAL = 300.0
 
-    def _parse_arp_table(self):
+    # Neighbour states that mean "this device answered recently". STALE
+    # means the kernel hasn't confirmed it for a while — Linux keeps STALE
+    # entries indefinitely on a small LAN (they're only garbage-collected
+    # once the table holds more than gc_thresh1 = 128 entries), so treating
+    # mere presence in the table as "seen now" kept switched-off devices
+    # "Active" for days.
+    _FRESH_STATES = {"REACHABLE", "DELAY", "PROBE", "PERMANENT", "NOARP"}
+    _DEAD_STATES  = {"FAILED", "INCOMPLETE"}
+
+    def _parse_neigh_json(self, text):
+        result = {}
+        entries = json.loads(text)
+        if not isinstance(entries, list):
+            raise ValueError("ip -j neigh: expected a JSON array")
+        for e in entries:
+            if not isinstance(e, dict):
+                continue
+            ip, mac = e.get("dst"), e.get("lladdr")
+            states = e.get("state") or []
+            if isinstance(states, str):
+                states = [states]
+            states = {str(x).upper() for x in states}
+            if not ip or not mac or mac == "00:00:00:00:00:00":
+                continue
+            if states & self._DEAD_STATES:
+                continue
+            result[mac.lower()] = {"ip": ip, "iface": e.get("dev", ""),
+                                   "fresh": bool(states & self._FRESH_STATES)}
+        return result
+
+    def _parse_proc_arp(self):
         result = {}
         try:
             with open("/proc/net/arp") as f:
@@ -729,12 +751,36 @@ class ARPPassiveThread(threading.Thread):
                     ip, _hw, flags, mac, _mask, iface = parts[:6]
                     if flags == "0x0" or mac == "00:00:00:00:00:00":
                         continue
-                    result[mac] = {"ip": ip, "iface": iface}
+                    # /proc/net/arp has no neighbour state, so presence is
+                    # all there is to go on.
+                    result[mac.lower()] = {"ip": ip, "iface": iface, "fresh": True}
         except OSError as e:
             # /proc/net/arp should basically always be readable on Linux, so
             # unlike a genuinely absent sensor, this is worth surfacing.
-            _note("ARPPassiveThread._parse_arp_table", e)
+            _note("ARPPassiveThread._parse_proc_arp", e)
         return result
+
+    def _parse_arp_table(self):
+        """{mac: {"ip", "iface", "fresh"}} — fresh is False for entries the
+        kernel only holds as STALE. Uses `ip -4 -j neigh` (iproute2 ≥ 4.13,
+        standard on Debian 10+) for the neighbour state, falling back to
+        /proc/net/arp when that's unavailable."""
+        if self._ip_json is not False:
+            ip_path = shutil.which("ip")
+            if ip_path:
+                try:
+                    r = subprocess.run([ip_path, "-4", "-j", "neigh", "show"],
+                                       capture_output=True, text=True, timeout=2)
+                    if r.returncode == 0:
+                        parsed = self._parse_neigh_json(r.stdout or "[]")
+                        self._ip_json = True
+                        return parsed
+                except Exception as e:
+                    if self._ip_json:  # worked before, so this is a real failure
+                        _note("ARPPassiveThread._parse_arp_table (ip neigh)", e)
+            if not self._ip_json:
+                self._ip_json = False  # absent / too old: stop trying
+        return self._parse_proc_arp()
 
     def _refresh_network_identity(self, now):
         net_id, cidrs = current_network()
@@ -875,10 +921,13 @@ class ARPPassiveThread(threading.Thread):
                                 )
                             else:
                                 # Either pre-existing, or it raced in between the two
-                                # lock acquisitions — just update it.
+                                # lock acquisitions — just update it. Only a
+                                # neighbour entry the kernel confirmed recently
+                                # counts as seeing the device now.
                                 dev           = devices[mac]
                                 dev.ip        = info["ip"]
-                                dev.last_seen = now
+                                if info.get("fresh", True):
+                                    dev.last_seen = now
                                 dev.status    = _device_status(dev)
                                 if known_devices.is_known(self._known, net_id, mac):
                                     # dev.hostname, not `hostname`: only new MACs
@@ -1441,17 +1490,7 @@ class StorageThread(threading.Thread):
         self._disk_alert_level = {"fs_root": 0}
 
     def _write_disk_alert(self, msg):
-        try:
-            # Sudo-aware — see SystemThread._write_temp_alert.
-            log_path = sensors.user_data_path("disk_alerts.log")
-            log_dir  = os.path.dirname(log_path)
-            os.makedirs(log_dir, exist_ok=True)
-            ts = _dt.now().strftime("%Y-%m-%d %H:%M:%S")
-            with open(log_path, "a") as f:
-                f.write(f"{ts} {msg}\n")
-            sensors.chown_to_invoking_user(log_dir, log_path)
-        except Exception as e:
-            _note("StorageThread._write_disk_alert", e)
+        sensors.append_alert("disk_alerts.log", msg)  # see _write_temp_alert
 
     def _check_disk_alert(self, mount_key, mount_label, fs):
         # Must never raise: run()'s bare try/except would otherwise drop the
@@ -2932,6 +2971,21 @@ class FullRenderer:
         self._hist_cache = (now, rows, sig)
         return rows
 
+    @staticmethod
+    def _median_interval(timestamps):
+        """Median spacing (seconds) between consecutive samples; 120s (the
+        logger default) when there are too few to estimate. Needs ≥3."""
+        if len(timestamps) < 3:
+            return 120.0
+        deltas = sorted(timestamps[i].timestamp() - timestamps[i - 1].timestamp()
+                        for i in range(1, len(timestamps)))
+        n = len(deltas)
+        median = deltas[n // 2] if n % 2 else (deltas[n // 2 - 1] + deltas[n // 2]) / 2
+        # A median of 0 (many duplicate/near-duplicate timestamps — bad clock
+        # resolution, manually edited/concatenated CSVs) would otherwise
+        # divide-by-zero in the resampling; it isn't a meaningful interval.
+        return max(median, 1.0)
+
     def _render_history(self, history_window, history_scroll=0):
         H, W = self.win.getmaxyx()
         cy = 2
@@ -2969,21 +3023,7 @@ class FullRenderer:
         # deltas between consecutive samples) so gap detection and the coverage
         # check adapt to a non-default --interval. Needs ≥3 rows to be
         # meaningful; otherwise assume the 120s default.
-        if len(filtered) >= 3:
-            deltas = sorted(
-                filtered[i]["ts"].timestamp() - filtered[i - 1]["ts"].timestamp()
-                for i in range(1, len(filtered)))
-            n = len(deltas)
-            sample_interval = (deltas[n // 2] if n % 2
-                               else (deltas[n // 2 - 1] + deltas[n // 2]) / 2)
-            # A median of 0 (many duplicate/near-duplicate timestamps — bad
-            # clock resolution, manually edited/concatenated CSVs) would
-            # otherwise divide-by-zero in the resampling below; it also isn't
-            # a meaningful interval, so fall back to the same floor used when
-            # there isn't enough data to estimate one at all.
-            sample_interval = max(sample_interval, 1.0)
-        else:
-            sample_interval = 120.0
+        sample_interval = self._median_interval([r["ts"] for r in filtered])
 
         def _fmt_axis(dt_obj):
             # 1h / 8h / 24h windows use clock time; 7d / 30d use calendar date.
@@ -3059,10 +3099,13 @@ class FullRenderer:
             old_t = true_oldest.timestamp()
             new_t = true_newest.timestamp()
             span  = max(new_t - old_t, 1.0)
-            # Never make bins narrower than the estimated sample interval, or
-            # a normally-running logger would leave most bins empty and
-            # speckle the chart with false gaps.
-            n_bins = max(2, min(max_points, int(span / sample_interval) + 1))
+            # Never make bins narrower than this metric's own sample interval,
+            # or a normally-running logger would leave most bins empty and
+            # speckle the chart with false gaps. Per metric, not per row: a
+            # sensor that only reports every few samples (or was added later)
+            # would otherwise show a gap marker between every reading.
+            metric_interval = max(sample_interval, self._median_interval(timestamps))
+            n_bins = max(2, min(max_points, int(span / metric_interval) + 1))
             bin_w  = span / n_bins
             sums   = [0.0] * n_bins
             counts = [0]   * n_bins
@@ -3226,6 +3269,12 @@ def _curses_main(stdscr, args, cfg_errors=None):
 
     tabs           = build_tabs()
     active_tab     = max(1, min(len(tabs), args.tab))
+    if active_tab != args.tab:
+        # The tab list depends on the machine (BACKUP is optional), so a
+        # configured tab number can be out of range on one host and fine on
+        # another — say what happened rather than silently picking another.
+        push_alert(f"tab {args.tab} doesn't exist here ({len(tabs)} tabs) — "
+                   f"opened {tabs[active_tab - 1][1]} instead")
     mode           = "normal"
     log_filter     = ""
     filter_buf     = ""

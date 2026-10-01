@@ -528,3 +528,108 @@ class CliTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class NeighbourStateTests(unittest.TestCase):
+    SAMPLE = json.dumps([
+        {"dst": "192.168.1.1", "dev": "eth0", "lladdr": "AA:AA:AA:AA:AA:01", "state": ["REACHABLE"]},
+        {"dst": "192.168.1.2", "dev": "eth0", "lladdr": "aa:aa:aa:aa:aa:02", "state": ["STALE"]},
+        {"dst": "192.168.1.3", "dev": "eth0", "state": ["FAILED"]},
+        {"dst": "192.168.1.4", "dev": "eth0", "lladdr": "aa:aa:aa:aa:aa:04", "state": ["INCOMPLETE"]},
+        {"dst": "192.168.1.5", "dev": "eth0", "lladdr": "aa:aa:aa:aa:aa:05", "state": ["DELAY"]},
+        {"dst": "192.168.1.6", "dev": "eth0", "lladdr": "00:00:00:00:00:00", "state": ["NOARP"]},
+        "junk",
+    ])
+
+    def test_states(self):
+        arp = sw.ARPPassiveThread.__new__(sw.ARPPassiveThread)
+        parsed = arp._parse_neigh_json(self.SAMPLE)
+        self.assertEqual(set(parsed), {"aa:aa:aa:aa:aa:01", "aa:aa:aa:aa:aa:02", "aa:aa:aa:aa:aa:05"})
+        self.assertTrue(parsed["aa:aa:aa:aa:aa:01"]["fresh"])
+        self.assertFalse(parsed["aa:aa:aa:aa:aa:02"]["fresh"])
+        self.assertTrue(parsed["aa:aa:aa:aa:aa:05"]["fresh"])
+
+    def test_falls_back_to_proc_when_ip_is_missing_or_too_old(self):
+        arp = sw.ARPPassiveThread.__new__(sw.ARPPassiveThread)
+        arp._ip_json = None
+        old_ip = subprocess.CompletedProcess([], 255, stdout="", stderr='Option "-j" is unknown')
+        with mock.patch.object(sw.shutil, "which", return_value="/sbin/ip"), \
+                mock.patch.object(sw.subprocess, "run", return_value=old_ip), \
+                mock.patch.object(arp, "_parse_proc_arp", return_value={"x": 1}) as proc:
+            self.assertEqual(arp._parse_arp_table(), {"x": 1})
+            self.assertIs(arp._ip_json, False)
+            arp._parse_arp_table()
+        self.assertEqual(proc.call_count, 2)
+
+    def test_stale_entry_does_not_refresh_last_seen(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        with mock.patch.object(sw, "KNOWN_DEVICES_PATH", os.path.join(tmp.name, "k.json")), \
+                mock.patch.object(sw, "TRUSTED_NETWORKS_PATH", os.path.join(tmp.name, "t.json")), \
+                mock.patch.object(sw, "current_network", return_value=("gw:aa", [])), \
+                mock.patch.object(sw, "_resolve_hostname", side_effect=lambda ip: ip), \
+                mock.patch.object(sw, "ARP_REFRESH", 0.02):
+            with sw._state_lock:
+                sw._state["devices"] = {"m": sw.DeviceInfo("10.0.0.2", "m", "h", 0, time.time() - 3000, "Active")}
+            self.addCleanup(lambda: sw._state.__setitem__("devices", {}))
+            arp = sw.ARPPassiveThread()
+            arp._parse_arp_table = lambda: {"m": {"ip": "10.0.0.2", "iface": "eth0", "fresh": False}}
+            arp._net_id = "gw:aa"  # same network: don't clear the list
+            arp.start()
+            time.sleep(0.2)
+            arp.stop()
+            arp.join(2)
+        dev = sw.get_state()["devices"]["m"]
+        self.assertLess(dev.last_seen, time.time() - 2000)
+        self.assertEqual(dev.status, "Idle")
+
+
+class AlertWriterTests(unittest.TestCase):
+    def test_only_one_process_writes(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        code = ("import sys, time; sys.path.insert(0, sys.argv[1]); import syswatch_sensors as s;"
+                "print(s.append_alert('temp_alerts.log', sys.argv[3], directory=sys.argv[2]), flush=True);"
+                "time.sleep(float(sys.argv[4]))")
+        first = subprocess.Popen([sys.executable, "-c", code, helpers.ROOT, tmp.name, "A", "2"],
+                                 stdout=subprocess.PIPE, text=True)
+        self.assertEqual(first.stdout.readline().strip(), "True")
+        second = subprocess.run([sys.executable, "-c", code, helpers.ROOT, tmp.name, "B", "0"],
+                                capture_output=True, text=True, timeout=30)
+        self.assertEqual(second.stdout.strip(), "False")
+        first.wait(10)
+        first.stdout.close()
+        # The writer exited, so the lock is free again.
+        third = subprocess.run([sys.executable, "-c", code, helpers.ROOT, tmp.name, "C", "0"],
+                               capture_output=True, text=True, timeout=30)
+        self.assertEqual(third.stdout.strip(), "True")
+        with open(os.path.join(tmp.name, "temp_alerts.log")) as f:
+            self.assertEqual([ln.split()[-1] for ln in f], ["A", "C"])
+
+
+class HistoryIntervalTests(unittest.TestCase):
+    def test_median_interval(self):
+        t0 = datetime(2026, 1, 1)
+        ts = [t0 + timedelta(seconds=s) for s in (0, 120, 240, 360, 2000)]
+        self.assertEqual(sw.FullRenderer._median_interval(ts), 120)
+        self.assertEqual(sw.FullRenderer._median_interval(ts[:2]), 120.0)
+        self.assertEqual(sw.FullRenderer._median_interval([t0, t0, t0]), 1.0)
+
+    def test_sparse_metric_has_no_false_gaps(self):
+        _curses_patches(self)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        now = datetime.now()
+        with open(os.path.join(tmp.name, "metrics.csv"), "w") as f:
+            for i in range(180):  # 6h of 2-minute samples, temp on every 5th row only
+                t = now - timedelta(minutes=2 * (180 - i))
+                temp = "50.0" if i % 5 == 0 else ""
+                f.write(f"{t:%Y-%m-%dT%H:%M:%S},10,20,{temp},30\n")
+        with mock.patch.object(sw.sensors, "user_data_path",
+                               side_effect=lambda *p: os.path.join(tmp.name, *p)), \
+                mock.patch.object(sw, "THRESH", {}):
+            win = helpers.FakeWin(80, 120)
+            sw.FullRenderer(win, [("history", "HISTORY")]).render(1, {}, "", "normal", "", 1, 2)
+        text = win.text()
+        self.assertIn("TEMP °C", text)
+        self.assertNotIn("┊", text)

@@ -177,6 +177,59 @@ def chown_to_invoking_user(*paths):
             pass
 
 
+# ── alert logs (single writer) ───────────────────────────────────────────────
+#
+# The TUI and syswatch-logger both watch CPU temperature and disk usage and
+# used to both append to temp_alerts.log / disk_alerts.log — so with both
+# running (the normal setup) every alert was logged twice. Whichever process
+# first takes an exclusive flock on alerts.lock becomes the writer and keeps
+# the lock for its lifetime; the other skips the file write (it still rings
+# the bell / shows its footer alert). The kernel releases the lock when the
+# holder exits, so the other process takes over at its next alert.
+
+_alert_lock_fd   = None
+_alert_lock_mutex = threading.Lock()
+
+
+def _hold_alert_lock(directory):
+    global _alert_lock_fd
+    if _alert_lock_fd is not None:
+        return True
+    import fcntl
+    path = os.path.join(directory, "alerts.lock")
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        return False
+    _alert_lock_fd = fd
+    chown_to_invoking_user(path)
+    return True
+
+
+def append_alert(filename, msg, directory=None):
+    """Append a timestamped line to the alert log `filename` — in `directory`,
+    or the sudo-aware data dir by default — unless another syswatch process
+    is the alert writer. Returns True if this process wrote it. Never raises."""
+    try:
+        path = (os.path.join(directory, filename) if directory
+                else user_data_path(filename))
+        d = os.path.dirname(path)
+        os.makedirs(d, exist_ok=True)
+        with _alert_lock_mutex:
+            if not _hold_alert_lock(d):
+                return False
+            ts = _dt.now().strftime("%Y-%m-%d %H:%M:%S")
+            with open(path, "a") as f:
+                f.write(f"{ts} {msg}\n")
+        chown_to_invoking_user(d, path)
+        return True
+    except Exception as e:
+        note_error(f"append_alert ({filename})", e)
+        return False
+
+
 # ── platform identity ────────────────────────────────────────────────────────
 
 _is_pi_cache = None

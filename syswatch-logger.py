@@ -10,17 +10,18 @@ from datetime import datetime as _dt
 
 
 def _bootstrap():
+    # psutil is the one third-party dependency. It used to be pip-installed
+    # here on first run — under `sudo` that meant pip writing into the system
+    # Python with --break-system-packages, which can break apt-managed
+    # packages. Now it's installed by install-syswatch.sh (apt's
+    # python3-psutil); if it's missing, say how to get it and stop.
     import importlib.util as ilu
-    missing = [p for p in ("psutil",) if ilu.find_spec(p) is None]
-    if missing:
-        print(f"Installing: {', '.join(missing)} …")
-        try:
-            subprocess.check_call(
-                [sys.executable, "-m", "pip", "install", "--quiet"] + missing)
-        except subprocess.CalledProcessError:
-            subprocess.check_call(
-                [sys.executable, "-m", "pip", "install", "--quiet",
-                 "--break-system-packages"] + missing)
+    if ilu.find_spec("psutil") is None:
+        sys.stderr.write(
+            "syswatch needs the psutil Python module, which isn't installed.\n"
+            "Install it with:  sudo apt install python3-psutil\n"
+            "(or re-run install-syswatch.sh, which does this for you).\n")
+        sys.exit(1)
 
 _bootstrap()
 import psutil
@@ -55,16 +56,9 @@ def _core_voltage():
 
 
 def _append_alert(log_dir, filename, msg):
-    try:
-        path = os.path.join(log_dir, filename)
-        ts = _dt.now().strftime("%Y-%m-%d %H:%M:%S")
-        with open(path, "a") as f:
-            f.write(f"{ts} {msg}\n")
-        # No-op unless running under sudo, where a newly created alert log
-        # would otherwise be root-owned inside the user's home.
-        sensors.chown_to_invoking_user(path)
-    except Exception as e:
-        sensors.note_error("_append_alert", e)
+    # append_alert makes sure only one of syswatch-logger / the TUI writes
+    # each alert, instead of both logging it.
+    sensors.append_alert(filename, msg, directory=log_dir)
 
 
 def _check_temp_alert(log_dir, temp, thresh_pair, prev_level):

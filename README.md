@@ -10,10 +10,9 @@ syswatch detects the hardware it's running on and adapts: Raspberry Pi throttle 
 
 - Any Linux with systemd
 - Python 3.9 – 3.13
-- [psutil](https://github.com/giampaolo/psutil) — installed automatically on first run if missing
-- [asciichartpy](https://github.com/kroitor/asciichart) — installed automatically on first run if missing
+- [psutil](https://github.com/giampaolo/psutil) — `sudo apt install python3-psutil`. The installer does this for you. syswatch no longer pip-installs anything at runtime: if psutil is missing, it says how to install it and exits.
 
-No other third-party dependencies. Config parsing uses the standard library's `tomllib` on Python 3.11+, and a small built-in fallback parser on 3.9/3.10.
+[asciichartpy](https://github.com/kroitor/asciichart) (MIT), used for the HISTORY charts, is bundled as `syswatch_asciichart.py`, so there are no other third-party dependencies. Config parsing uses the standard library's `tomllib` on Python 3.11+, and a small built-in fallback parser on 3.9/3.10.
 
 Soft dependencies (each feature degrades gracefully — hiding the relevant row — if the tool isn't installed):
 - `lm-sensors` (`sensors-detect`) for CPU/motherboard temperature sensors on non-Pi hardware
@@ -173,6 +172,8 @@ Real-time CPU usage for each core plus an average bar with sparkline history. RA
 ### 2 · NETWORK
 Lists the devices on the local network — IP address, MAC address, resolved hostname, time since last seen, and status (Active / Recent / Idle / INTRUDER) — by reading the kernel's neighbour (ARP) table passively. That passive reading is all syswatch does on a network unless you explicitly allow more.
 
+"Last seen" comes from the kernel's neighbour state (`ip -j neigh`). Only an entry the kernel has recently confirmed (REACHABLE/DELAY/PROBE) counts as seeing the device; a STALE entry doesn't. Linux keeps STALE entries indefinitely on small networks, so a switched-off device would otherwise stay "Active" for days. Without iproute2's JSON output, syswatch falls back to `/proc/net/arp`, which has no state, so presence in the table is all it can use.
+
 **Two separate keys, two separate kinds of trust:**
 
 - **`[t]` — trust all devices.** Every currently listed device is written into the [known-devices allowlist](#known-devices-allowlist) and any INTRUDER flags are cleared. That's all: it does **not** make syswatch scan the network. `syswatch --trust-all-devices` does the same without the TUI.
@@ -271,7 +272,7 @@ Like the temperature alert, syswatch monitors filesystem usage of `/` and, if pr
 ~/.local/share/syswatch/disk_alerts.log
 ```
 
-syswatch-logger checks `/` against the same thresholds independently and appends to the same file, so the alert keeps working while only the logger service is running.
+syswatch-logger checks `/` against the same thresholds independently, so the alert keeps working while only the logger service is running. When both are running, only one of them writes each alert line (whichever holds `~/.local/share/syswatch/alerts.lock`), so alerts aren't logged twice.
 
 The alert fires once per upward crossing per mount — it will not repeat every cycle while usage stays high, but will fire again if usage drops below the threshold and rises back above it.
 
@@ -304,7 +305,7 @@ When the CPU temperature crosses a threshold for the first time, syswatch rings 
 ~/.local/share/syswatch/temp_alerts.log
 ```
 
-The directory is created automatically if it does not exist. syswatch-logger checks CPU temperature against the same thresholds independently and appends to the same file, so the alert keeps working while only the logger service is running. The alert fires once per upward crossing — it will not repeat every second while the temperature stays high, but will fire again if the temperature drops below the threshold and rises back above it.
+The directory is created automatically if it does not exist. syswatch-logger checks CPU temperature against the same thresholds independently, so the alert keeps working while only the logger service is running. When both are running, only one of them writes each alert line (whichever holds `~/.local/share/syswatch/alerts.lock`), so alerts aren't logged twice. The alert fires once per upward crossing — it will not repeat every second while the temperature stays high, but will fire again if the temperature drops below the threshold and rises back above it.
 
 Thresholds (configurable via `[thresholds] cpu_temp` in your config):
 - **WARNING** — 70 °C
