@@ -395,7 +395,7 @@ python3 -m unittest discover -s tests -t tests
 
 `tests/test_installer.py` runs `install-syswatch.sh` end to end: install, upgrade over a fake old version, keep/replace/delete answers, and uninstall/purge. It needs root, because it creates a throwaway user, and is skipped otherwise. Run it with `sudo python3 -m unittest discover -s tests -t tests -p test_installer.py`. It installs into a scratch directory with a stub `systemctl`, so it doesn't touch the real system. GitHub Actions runs the whole suite on Python 3.9–3.13, plus the installer tests and `shellcheck`, on every push.
 
-It covers config parsing/validation (both the `tomllib` and the Python 3.9/3.10 fallback parser), the known-devices allowlist, sensor parsing (`smartctl`/`nvidia-smi` output, device-mapper root disks), syswatch-logger's trimming and alerts, the collector threads, rendering of every tab at several terminal sizes with both normal and malformed data, and end-to-end runs of `--report`, `--write-default-config`, `--trust-all-devices` and the TUI itself in a pseudo-terminal.
+It covers config parsing/validation (both the `tomllib` and the Python 3.9/3.10 fallback parser), the scan-safety rules (`tests/test_trust.py`: `[t]` never enables scanning, only `[y]` confirms `[s]`, no ping ever leaves an untrusted, changed or unconfirmed network), the known-devices allowlist, sensor parsing (`smartctl`/`nvidia-smi` output, device-mapper root disks), syswatch-logger's trimming and alerts, the collector threads, rendering of every tab at several terminal sizes with both normal and malformed data, and end-to-end runs of `--report`, `--write-default-config`, `--trust-all-devices` and the TUI itself in a pseudo-terminal.
 
 ---
 
