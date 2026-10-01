@@ -27,14 +27,48 @@ Soft dependencies (each feature degrades gracefully — hiding the relevant row 
 sudo bash install-syswatch.sh
 ```
 
-This copies `syswatch.py`, `syswatch_sensors.py`, `syswatch_config.py` and `syswatch_known_devices.py` to `/usr/local/lib/syswatch/` and creates a wrapper at `/usr/local/bin/syswatch` so the command is available system-wide. It also copies `syswatch-logger.py`, installs `syswatch-logger.service`, and starts the service so metrics collection begins immediately. It writes a fully commented example config to `/usr/share/doc/syswatch/config.example.toml` for reference.
+The same command installs a fresh copy or upgrades an existing one.
 
-Unlike before, **install also creates a real `config.toml`** for the user behind `sudo` (not root) — at `~/.config/syswatch/config.toml`, resolved from `$SUDO_USER`'s home, not root's. It asks a short set of questions worth answering per machine — the alert thresholds (CPU/RAM/disk/GPU/storage-temp warning and critical percentages), `[network] scan` mode and INTRUDER alerting, the TUI refresh rate and starting tab, and the logger's sample interval and retention — showing the built-in default in `[brackets]` for each; press Enter to accept it. Everything else is written from the built-in defaults untouched, so the result is always a complete, valid config, not a partial one. Answers are validated with the same rules `syswatch` itself enforces at startup; an invalid answer reprompts instead of being silently accepted.
+**What it installs**
+- All `syswatch*.py` modules go to `/usr/local/lib/syswatch/`, with a wrapper at `/usr/local/bin/syswatch`.
+- `syswatch-logger.service` is installed and started, running as you, so metrics collection begins immediately.
+- A fully commented example config goes to `/usr/share/doc/syswatch/config.example.toml`.
+- If `python3-psutil` is missing, it's installed with apt.
 
-- `--unattended` skips every question and writes the file with pure built-in defaults — useful when provisioning several machines from a script. This is also detected and applied automatically whenever stdin isn't a terminal (e.g. `curl ... | sudo bash`), so the installer never hangs waiting for input it can't get.
-- `--user NAME` installs for that account (the logger service's `User=` and where `config.toml` is written) instead of the one behind `sudo`. It's required when running the installer as plain `root` with no `$SUDO_USER` — there is no fallback username; the installer refuses rather than guessing.
-- `--skip-config` writes no config file at all, matching the old behaviour — run `syswatch --write-default-config` yourself later, or just run with no config and get built-in defaults.
-- Re-running the installer (an upgrade/reinstall) never touches an existing `config.toml` — if one is already there, install leaves it alone and says so, rather than re-asking or silently skipping without telling you.
+**Upgrading an older version.** Any earlier syswatch is detected — its version is shown, or "older than 1.1" for versions that didn't record one — and its program files are removed completely before the new ones go in. That covers `/usr/local/lib/syswatch/`, the wrapper, the logger service and the doc directory, so no stale module or cache from an older layout survives. Two more checks run at the same time:
+- Another `syswatch` launcher elsewhere (e.g. `~/.local/bin/syswatch` from a manual install) is listed and you're asked whether to remove it (default: keep). For a symlink, only the link is removed, never the file it points to.
+- A copy of `asciichartpy` that older versions pip-installed is reported with the command to remove it, but not removed, since something else might use it.
+
+**Existing config.** If `~/.config/syswatch/config.toml` exists, you get a summary of it:
+- when it was last changed
+- every setting that differs from the built-in defaults, with the default shown next to it
+- anything this version treats differently (for example `scan = true`, which no longer exists, or an unknown key)
+
+Then you choose to keep it (the default) or replace it. Replacing renames the old file to `config.toml.bak-<date>` and asks the setup questions below.
+
+**Existing data files.** Each file in `~/.local/share/syswatch/` gets a one-line summary and a keep (default) / delete question:
+- metrics history: number of samples and date range
+- alert logs: number of entries and the last one
+- known devices: number of devices and networks
+- trusted-for-scanning networks
+- debug log
+
+Files there owned by another user (left by running an old version with `sudo`) are given back to you.
+
+**Leftovers in root's home.** Older versions run with `sudo` kept their config and data in root's home instead of yours. If any are found, they're shown the same way, each with a keep (default) / delete question.
+
+**New config.** With no config yet, it asks a short set of questions worth answering per machine:
+- the alert thresholds (CPU/RAM/disk/GPU/storage-temp warning and critical levels)
+- `[network] scan` mode and INTRUDER alerting
+- the TUI refresh rate and starting tab
+- the logger's sample interval and retention
+
+Each question shows the built-in default in `[brackets]`; press Enter to accept it. Everything else is written from the built-in defaults, so the result is always a complete, valid config. Answers are validated with the same rules `syswatch` itself uses at startup, and an invalid answer asks again.
+
+Options:
+- `--unattended` asks nothing. It replaces the program, keeps every existing config and data file, and writes a default config only if there's none. This also happens automatically whenever stdin isn't a terminal (e.g. `curl ... | sudo bash`), so the installer never waits for input it can't get.
+- `--user NAME` installs for that account (the logger service's `User=` and where `config.toml` is written) instead of the one behind `sudo`. It's required when running the installer as plain `root` with no `$SUDO_USER`. There is no fallback username; the installer refuses rather than guessing.
+- `--skip-config` neither writes nor reviews `config.toml`. Run `syswatch --write-default-config` later, or just run with built-in defaults.
 
 ---
 
@@ -79,6 +113,7 @@ syswatch reads `$XDG_CONFIG_HOME/syswatch/config.toml` (default `~/.config/syswa
 | `~/.config/syswatch/config.toml` | thresholds and settings |
 | `~/.local/share/syswatch/metrics.csv` | HISTORY tab data |
 | `~/.local/share/syswatch/known_devices.json` | INTRUDER allowlist |
+| `~/.local/share/syswatch/trusted_networks.json` | networks you confirmed for active scanning |
 | `~/.local/share/syswatch/temp_alerts.log`, `disk_alerts.log` | alert history |
 | `~/.local/share/syswatch/debug.log` | `--debug` output |
 
@@ -358,6 +393,8 @@ The test suite uses only the standard library's `unittest` (plus `psutil`/`ascii
 python3 -m unittest discover -s tests -t tests
 ```
 
+`tests/test_installer.py` runs `install-syswatch.sh` end to end: install, upgrade over a fake old version, keep/replace/delete answers, and uninstall/purge. It needs root, because it creates a throwaway user, and is skipped otherwise. Run it with `sudo python3 -m unittest discover -s tests -t tests -p test_installer.py`. It installs into a scratch directory with a stub `systemctl`, so it doesn't touch the real system. GitHub Actions runs the whole suite on Python 3.9–3.13, plus the installer tests and `shellcheck`, on every push.
+
 It covers config parsing/validation (both the `tomllib` and the Python 3.9/3.10 fallback parser), the known-devices allowlist, sensor parsing (`smartctl`/`nvidia-smi` output, device-mapper root disks), syswatch-logger's trimming and alerts, the collector threads, rendering of every tab at several terminal sizes with both normal and malformed data, and end-to-end runs of `--report`, `--write-default-config`, `--trust-all-devices` and the TUI itself in a pseudo-terminal.
 
 ---
@@ -368,4 +405,6 @@ It covers config parsing/validation (both the `tomllib` and the Python 3.9/3.10 
 sudo bash install-syswatch.sh --uninstall
 ```
 
-This stops and disables `syswatch-logger.service`, removes its service file, and removes `/usr/local/bin/syswatch`, `/usr/local/lib/syswatch/`, and `/usr/share/doc/syswatch/`. It does not remove `~/.config/syswatch/` (your config) or `~/.local/share/syswatch/` (the metrics CSV, alert logs, and known-devices allowlist).
+This stops and removes `syswatch-logger.service` and removes `/usr/local/bin/syswatch`, `/usr/local/lib/syswatch/` and `/usr/share/doc/syswatch/`. It then shows your config and each data file with the same summaries as the installer, and asks whether to keep each one (the default is keep). Leftovers in root's home are offered the same way. Without a terminal, everything is kept.
+
+`sudo bash install-syswatch.sh --uninstall --purge` deletes `~/.config/syswatch/` and `~/.local/share/syswatch/` (and root's copies, if any) without asking.
