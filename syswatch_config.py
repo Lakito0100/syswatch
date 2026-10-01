@@ -138,18 +138,19 @@ def _v_bool(path, v, errors):
 
 def _v_scan_mode(path, v, errors):
     # Normalizes to one of "known" / "always" / "never" — the same
-    # vocabulary --scan uses. Accepts real TOML booleans (true/false) and
-    # the strings "known", "true", "false" so an existing `scan = true` or
-    # `scan = false` config keeps working exactly as before.
+    # vocabulary --scan uses. Accepts real TOML booleans (true/false), the
+    # strings "known", "true", "false" so an existing `scan = true` or
+    # `scan = false` config keeps working exactly as before, and the
+    # --scan spellings "always"/"never" so the CLI vocabulary works too.
     if isinstance(v, bool):
         return "always" if v else "never"
     if isinstance(v, str):
         lv = v.strip().lower()
         if lv == "known":
             return "known"
-        if lv == "true":
+        if lv in ("true", "always"):
             return "always"
-        if lv == "false":
+        if lv in ("false", "never"):
             return "never"
     errors.append(f'{path}: expected "known", true, or false, got {v!r}')
     return None
@@ -237,7 +238,7 @@ _SCHEMA = {
         "known_devices_retention_days": _v_int(1, 3650),
     },
     "ui": {
-        "refresh":          _v_num(0.1, 60),
+        "refresh":          _v_num(0.5, 60),
         "default_tab":      _v_int(1, 20),
         "top_n":            _v_int(1, 50),
         "history":          _v_int(2, 10000),
@@ -289,10 +290,15 @@ def _split_top_level(s):
     cur = ""
     in_str = False
     quote = ""
+    escaped = False
     for c in s:
         if in_str:
             cur += c
-            if c == quote:
+            if escaped:
+                escaped = False
+            elif c == "\\" and quote == '"':
+                escaped = True
+            elif c == quote:
                 in_str = False
         else:
             if c in ("'", '"'):
@@ -312,7 +318,11 @@ def _split_top_level(s):
 def _parse_scalar(s, lineno):
     s = s.strip()
     if len(s) >= 2 and s[0] == s[-1] == '"':
-        return s[1:-1].encode().decode("unicode_escape")
+        # latin-1 + backslashreplace, not a plain .encode(): unicode_escape
+        # decodes bytes as latin-1, so feeding it UTF-8 bytes turned any
+        # non-ASCII character into mojibake ("ü" -> "Ã¼"). backslashreplace
+        # turns non-latin-1 characters into \uXXXX escapes it decodes back.
+        return s[1:-1].encode("latin-1", "backslashreplace").decode("unicode_escape")
     if len(s) >= 2 and s[0] == s[-1] == "'":
         return s[1:-1]
     if s == "true":
@@ -324,7 +334,7 @@ def _parse_scalar(s, lineno):
     try:
         return float(s)
     except ValueError:
-        raise _TomlFallbackError(f"line {lineno}: cannot parse value {s!r}")
+        raise _TomlFallbackError(f"line {lineno}: cannot parse value {s!r}") from None
 
 
 def _parse_value(val, lineno):
@@ -560,9 +570,9 @@ storage_temp = {storage_temp}
 #                        known_devices.json; passive ARP reading everywhere
 #                        else. Press [t] on the NETWORK tab (or run
 #                        --trust-all-devices) to mark a network as known.
-#   true               — always sweep, regardless of whether the network
+#   true / "always"    — always sweep, regardless of whether the network
 #                        is known (the old unconditional behaviour)
-#   false              — never sweep; passive ARP reading only
+#   false / "never"    — never sweep; passive ARP reading only
 scan             = {scan}
 subnet           = "192.168.1.0/24"     # fallback CIDR swept when no local network is auto-detected
 intruder_alerts  = {intruder_alerts}                 # flag devices never seen on this network as INTRUDER

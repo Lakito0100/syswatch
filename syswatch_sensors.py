@@ -198,14 +198,17 @@ def platform_model():
     except Exception:
         pass
     try:
-        for line in open("/proc/cpuinfo"):
-            if line.startswith("Model"):
-                return line.split(":", 1)[1].strip()
+        with open("/proc/cpuinfo") as f:
+            for line in f:
+                if line.startswith("Model"):
+                    return line.split(":", 1)[1].strip()
     except Exception:
         pass
     try:
-        vendor  = open("/sys/class/dmi/id/sys_vendor").read().strip()
-        product = open("/sys/class/dmi/id/product_name").read().strip()
+        with open("/sys/class/dmi/id/sys_vendor") as f:
+            vendor = f.read().strip()
+        with open("/sys/class/dmi/id/product_name") as f:
+            product = f.read().strip()
         model = " ".join(p for p in (vendor, product) if p)
         if model:
             return model
@@ -256,6 +259,12 @@ def cpu_temp():
     try:
         with open("/sys/class/thermal/thermal_zone0/temp") as f:
             return round(int(f.read().strip()) / 1000, 1)
+    except FileNotFoundError:
+        # No thermal zone at all (VMs, containers, many desktops without
+        # lm-sensors set up) — an absent sensor, not a broken one. Recording
+        # it as an error lit the header's degraded ⚠ permanently on exactly
+        # the machines where the TEMP row already explains what's missing.
+        pass
     except Exception as e:
         note_error("cpu_temp (thermal_zone0 fallback)", e)
     return None
@@ -384,6 +393,37 @@ def gpu_temp():
 _root_device_cache = None
 
 
+def _physical_disk(partition):
+    """Name of the whole physical disk (e.g. "nvme0n1", "sda") underneath
+    `partition`, or None if lsblk can't tell.
+
+    `lsblk -s` walks the dependency chain *downwards* from the given device,
+    so this resolves through any stack of device-mapper layers. Asking only
+    for the immediate parent (PKNAME) was wrong for the default Ubuntu/Debian
+    encrypted or LVM install: the parent of /dev/mapper/vg-root is the LUKS
+    container or the partition (e.g. "nvme0n1p3"), not the disk, so SMART was
+    queried on a partition and /sys/block/<base>/stat — which only exists for
+    whole disks — couldn't be read at all.
+    """
+    if not shutil.which("lsblk"):
+        return None
+    try:
+        r = subprocess.run(["lsblk", "-nrso", "NAME,TYPE", partition],
+                           capture_output=True, text=True, timeout=2)
+        if r.returncode == 0:
+            for line in r.stdout.splitlines():
+                fields = line.split()
+                if len(fields) >= 2 and fields[1] == "disk":
+                    return fields[0]
+        r = subprocess.run(["lsblk", "-no", "PKNAME", partition],
+                           capture_output=True, text=True, timeout=2)
+        if r.returncode == 0 and r.stdout.strip():
+            return r.stdout.strip().splitlines()[0].strip()
+    except Exception as e:
+        note_error("root_device (lsblk)", e)
+    return None
+
+
 def root_device():
     global _root_device_cache
     if _root_device_cache is not None:
@@ -409,13 +449,7 @@ def root_device():
     base = None
     if partition:
         dev_name = os.path.basename(partition)
-        try:
-            r = subprocess.run(["lsblk", "-no", "PKNAME", partition],
-                                capture_output=True, text=True, timeout=2)
-            if r.returncode == 0 and r.stdout.strip():
-                base = r.stdout.strip().splitlines()[0].strip()
-        except Exception as e:
-            note_error("root_device (lsblk)", e)
+        base = _physical_disk(partition)
         if not base:
             m = re.match(r"^(mmcblk\d+|nvme\d+n\d+|sd[a-z]+|vd[a-z]+|xvd[a-z]+)", dev_name)
             base = m.group(1) if m else dev_name

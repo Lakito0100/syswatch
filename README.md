@@ -33,6 +33,7 @@ This copies `syswatch.py`, `syswatch_sensors.py`, `syswatch_config.py` and `sysw
 Unlike before, **install also creates a real `config.toml`** for the user behind `sudo` (not root) — at `~/.config/syswatch/config.toml`, resolved from `$SUDO_USER`'s home, not root's. It asks a short set of questions worth answering per machine — the alert thresholds (CPU/RAM/disk/GPU/storage-temp warning and critical percentages), `[network] scan` mode and INTRUDER alerting, the TUI refresh rate and starting tab, and the logger's sample interval and retention — showing the built-in default in `[brackets]` for each; press Enter to accept it. Everything else is written from the built-in defaults untouched, so the result is always a complete, valid config, not a partial one. Answers are validated with the same rules `syswatch` itself enforces at startup; an invalid answer reprompts instead of being silently accepted.
 
 - `--unattended` skips every question and writes the file with pure built-in defaults — useful when provisioning several machines from a script. This is also detected and applied automatically whenever stdin isn't a terminal (e.g. `curl ... | sudo bash`), so the installer never hangs waiting for input it can't get.
+- `--user NAME` installs for that account (the logger service's `User=` and where `config.toml` is written) instead of the one behind `sudo`. It's required when running the installer as plain `root` with no `$SUDO_USER` — there is no fallback username; the installer refuses rather than guessing.
 - `--skip-config` writes no config file at all, matching the old behaviour — run `syswatch --write-default-config` yourself later, or just run with no config and get built-in defaults.
 - Re-running the installer (an upgrade/reinstall) never touches an existing `config.toml` — if one is already there, install leaves it alone and says so, rather than re-asking or silently skipping without telling you.
 
@@ -123,9 +124,9 @@ storage_temp = [65, 75]
 #                        known_devices.json; passive ARP reading everywhere
 #                        else. Press [t] on the NETWORK tab (or run
 #                        --trust-all-devices) to mark a network as known.
-#   true               — always sweep, regardless of whether the network
+#   true / "always"    — always sweep, regardless of whether the network
 #                        is known (the old unconditional behaviour)
-#   false              — never sweep; passive ARP reading only
+#   false / "never"    — never sweep; passive ARP reading only
 scan             = "known"
 subnet           = "192.168.1.0/24"     # fallback CIDR swept when no local network is auto-detected
 intruder_alerts  = true                 # flag devices never seen on this network as INTRUDER
@@ -317,9 +318,21 @@ It's keyed by network identity — the default gateway's MAC address where obtai
 }
 ```
 
-Writes are atomic (written to a temp file, then renamed into place), so a crash or power loss mid-write can't corrupt it. A missing, empty, truncated, or otherwise malformed file is treated as an empty allowlist rather than a crash. Entries not seen for `[network] known_devices_retention_days` (default 90) are pruned automatically. If the file genuinely can't be written (read-only home, full disk, wrong permissions) that's reported as a collector error — it lights the header ⚠ and is logged with `--debug` — rather than passing silently, which would otherwise look like `t` had worked while nothing was ever remembered between runs.
+Writes are atomic (written to a temp file, then renamed into place), so a crash or power loss mid-write can't corrupt it. A newly learned or trusted device is saved straight away; mere `last_seen` refreshes of devices already in the file are batched and written at most every 5 minutes (and on exit), so a long-running syswatch doesn't rewrite the file every couple of seconds — which matters on a Pi's SD card. A missing, empty, truncated, or otherwise malformed file is treated as an empty allowlist rather than a crash. Entries not seen for `[network] known_devices_retention_days` (default 90) are pruned automatically. If the file genuinely can't be written (read-only home, full disk, wrong permissions) that's reported as a collector error — it lights the header ⚠ and is logged with `--debug` — rather than passing silently, which would otherwise look like `t` had worked while nothing was ever remembered between runs.
 
 Add devices to the allowlist either by pressing `t` on the NETWORK tab, or by running `syswatch --trust-all-devices` (useful for a first-time setup on a trusted network, e.g. right after install). Delete the file to reset it, or edit `known_devices_retention_days` to control how long devices are remembered on networks you don't visit often.
+
+---
+
+## Tests
+
+The test suite uses only the standard library's `unittest` (plus `psutil`/`asciichartpy`, which syswatch itself needs) and runs on any Linux machine without root, sensors, systemd or a network — hardware-specific paths are exercised with mocked inputs. From the repository root:
+
+```bash
+python3 -m unittest discover -s tests -t tests
+```
+
+It covers config parsing/validation (both the `tomllib` and the Python 3.9/3.10 fallback parser), the known-devices allowlist, sensor parsing (`smartctl`/`nvidia-smi` output, device-mapper root disks), syswatch-logger's trimming and alerts, the collector threads, rendering of every tab at several terminal sizes with both normal and malformed data, and end-to-end runs of `--report`, `--write-default-config`, `--trust-all-devices` and the TUI itself in a pseudo-terminal.
 
 ---
 

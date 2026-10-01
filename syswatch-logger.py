@@ -93,6 +93,9 @@ def _check_disk_alert(log_dir, pct, thresh_pair, prev_level):
     return level
 
 
+_TRIM_INTERVAL = 3600.0  # seconds between retention trims
+
+
 def _trim(csv_path, days=30):
     try:
         cutoff = time.time() - days * 86400
@@ -110,8 +113,15 @@ def _trim(csv_path, days=30):
             except Exception:
                 pass
         if keep_from > 0:
-            with open(csv_path, "w") as f:
+            # Written to a temp file and renamed into place: rewriting
+            # metrics.csv in place left a window where the HISTORY tab (which
+            # reads it concurrently) saw a truncated or empty file, and a crash
+            # or power loss mid-write lost the whole history.
+            tmp = f"{csv_path}.tmp.{os.getpid()}"
+            with open(tmp, "w") as f:
                 f.writelines(lines[keep_from:])
+            os.replace(tmp, csv_path)
+            sensors.chown_to_invoking_user(csv_path)
     except Exception as e:
         sensors.note_error("_trim", e)
 
@@ -159,11 +169,19 @@ def main():
     # ownership only needs correcting for files it had to create.
     sensors.chown_to_invoking_user(log_dir, csv_path)
 
-    # Prime cpu_percent so the first non-blocking call has a valid baseline.
+    # Prime cpu_percent so the first non-blocking call has a valid baseline,
+    # and give it a moment to accumulate one: sampling immediately after
+    # priming measured a ~0s window, so every logger start wrote a junk
+    # (usually 0.0) CPU value into the history.
     psutil.cpu_percent(interval=None)
+    time.sleep(1.0)
 
     temp_alert_level = 0
     disk_alert_level = 0
+    # Trimming reads and rewrites the whole CSV; once per sample was wasteful
+    # with a short --interval (a month at 1s is millions of lines, re-read
+    # every second). Retention is in days, so trimming hourly is plenty.
+    last_trim = None
 
     while True:
         try:
@@ -191,7 +209,10 @@ def main():
                      f"{volt_str},{gtemp_str},{stemp_str},{batt_str}\n")
             with open(csv_path, "a") as f:
                 f.write(line)
-            _trim(csv_path, days=retention_days)
+            mono = time.monotonic()
+            if last_trim is None or mono - last_trim >= _TRIM_INTERVAL:
+                _trim(csv_path, days=retention_days)
+                last_trim = mono
             temp_alert_level = _check_temp_alert(log_dir, temp, thresh.get("cpu_temp"), temp_alert_level)
             disk_alert_level = _check_disk_alert(log_dir, disk, thresh.get("disk_pct"), disk_alert_level)
         except Exception as e:

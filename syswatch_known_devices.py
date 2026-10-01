@@ -30,7 +30,7 @@ def _read_gateway_mac():
                 fields = line.split()
                 if len(fields) < 3:
                     continue
-                _iface, dest, gateway = fields[0], fields[1], fields[2]
+                dest, gateway = fields[1], fields[2]
                 if dest == "00000000" and gateway != "00000000":
                     octets = [gateway[i:i + 2] for i in (6, 4, 2, 0)]
                     gw_ip = ".".join(str(int(o, 16)) for o in octets)

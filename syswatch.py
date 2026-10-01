@@ -290,6 +290,10 @@ class Metrics:
         try:
             with open("/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq") as f:
                 return int(f.read().strip()) // 1000
+        except FileNotFoundError:
+            # No cpufreq driver (VMs, containers, some ARM boards) — absent,
+            # not broken, so it mustn't light the degraded ⚠ every second.
+            return None
         except Exception as e:
             _note("Metrics._cpu_freq (sysfs fallback)", e)
             return None
@@ -341,6 +345,10 @@ class Metrics:
                             "signal":  float(parts[3].rstrip(".")),
                             "quality": float(parts[2].rstrip(".")),
                         }
+        except FileNotFoundError:
+            # Only present when the kernel has wireless extensions — i.e.
+            # absent on most wired-only machines. Not an error.
+            pass
         except Exception as e:
             _note("Metrics._wifi_signal", e)
         return None
@@ -358,21 +366,24 @@ class Metrics:
         return sorted(procs, key=lambda x: x["cpu_percent"], reverse=True)[:50]
 
     def collect(self):
+        """Sample every metric. Touches no shared state except this object's
+        own rate-calculation baselines, so it runs *outside* _state_lock —
+        it can take seconds (smartctl, nvidia-smi, vcgencmd, walking every
+        process) and holding the lock that long froze the whole UI. The
+        history deques are only appended to afterwards, by record(), under
+        the lock."""
         s = {}
         cores = psutil.cpu_percent(percpu=True)
         s["cores"] = cores
-        for i, p in enumerate(cores[:NUM_CORES]):
-            self.core_hist[i].append(p)
         # psutil.cpu_percent(percpu=True) should never return an empty list on
         # a real system, but if it ever did, dividing by len(cores) would
         # raise ZeroDivisionError and (per the outer try/except in
         # SystemThread.run()) silently drop the whole cycle's update.
         avg = sum(cores) / len(cores) if cores else 0.0
-        self.hist["cpu"].append(avg); s["cpu_avg"] = avg
+        s["cpu_avg"] = avg
 
         mem  = psutil.virtual_memory()
         swap = psutil.swap_memory()
-        self.hist["ram"].append(mem.percent)
         s.update(
             ram_used=mem.used, ram_total=mem.total, ram_pct=mem.percent,
             swap_used=swap.used, swap_total=swap.total, swap_pct=swap.percent,
@@ -398,35 +409,41 @@ class Metrics:
         s["voltage"]   = self._voltage()   if is_pi else None
         s["cpu_freq"]  = freq
         s["throttled"] = self._throttled() if is_pi else None
-        if ct   is not None: self.hist["cpu_temp"].append(ct)
-        if gt   is not None: self.hist["gpu_temp"].append(gt)
-        if st   is not None: self.hist["storage_temp"].append(st)
-        if freq is not None: self.hist["cpu_freq"].append(freq)
 
         disk = psutil.disk_usage("/")
         s.update(disk_used=disk.used, disk_total=disk.total, disk_pct=disk.percent)
         dr, dw = self._disk_io_rates()
         s["disk_read"] = dr; s["disk_write"] = dw
-        self.hist["disk_read"].append(dr); self.hist["disk_write"].append(dw)
 
         net = psutil.net_io_counters(); now = time.monotonic()
+        rx = tx = 0.0
         if net is not None and self._net0 is not None:
             dt = (now - self._net_t) or 1
             rx = max(0.0, (net.bytes_recv - self._net0.bytes_recv) / dt / 1024)
             tx = max(0.0, (net.bytes_sent - self._net0.bytes_sent) / dt / 1024)
-            self.hist["net_rx"].append(rx); self.hist["net_tx"].append(tx)
-        else:
-            self.hist["net_rx"].append(0.0); self.hist["net_tx"].append(0.0)
         if net is not None:
             self._net0 = net; self._net_t = now
-        s["net_rx"] = self.hist["net_rx"][-1]
-        s["net_tx"] = self.hist["net_tx"][-1]
+        s["net_rx"] = rx
+        s["net_tx"] = tx
 
         s["load_avg"]  = os.getloadavg()
         s["wifi"]      = self._wifi_signal()
         s["uptime"]    = time.time() - psutil.boot_time()
         s["top_procs"] = self._top_procs()
         return s
+
+    def record(self, s):
+        """Append one collect() result to the sparkline histories. Callers
+        hold _state_lock — get_state() snapshots these deques under it."""
+        for i, p in enumerate(s["cores"][:NUM_CORES]):
+            self.core_hist[i].append(p)
+        self.hist["cpu"].append(s["cpu_avg"])
+        self.hist["ram"].append(s["ram_pct"])
+        for key in ("cpu_temp", "gpu_temp", "storage_temp", "cpu_freq"):
+            if s.get(key) is not None:
+                self.hist[key].append(s[key])
+        for key in ("disk_read", "disk_write", "net_rx", "net_tx"):
+            self.hist[key].append(s[key])
 
 
 # ── shared state ───────────────────────────────────────────────────────────────
@@ -516,8 +533,42 @@ class DeviceInfo:
     status:     str
 
 
-_HOSTNAME_CACHE_TTL = 3600.0  # seconds
-_hostname_cache = {}  # ip -> (monotonic_ts, hostname)
+_HOSTNAME_CACHE_TTL   = 3600.0  # seconds
+_HOSTNAME_TIMEOUT     = 1.5     # seconds a caller waits for one lookup
+_HOSTNAME_RETRY_AFTER = 60.0    # seconds before re-trying a timed-out lookup
+_HOSTNAME_MAX_INFLIGHT = 8     # stuck lookups allowed to linger at once
+_hostname_cache = {}  # ip -> (monotonic_ts, hostname, ttl)
+_hostname_slots = threading.BoundedSemaphore(_HOSTNAME_MAX_INFLIGHT)
+
+
+def _getnameinfo_bounded(ip, timeout):
+    """socket.getnameinfo() on a daemon thread, waiting at most `timeout`.
+    Returns the name, or None if it timed out or no worker slot was free.
+    Daemon threads (not a ThreadPoolExecutor, whose workers are joined at
+    interpreter exit) so a lookup still stuck in the resolver can never delay
+    quitting; the semaphore caps how many of those can pile up."""
+    if not _hostname_slots.acquire(blocking=False):
+        return None
+    box = {}
+
+    def work():
+        try:
+            box["name"] = socket.getnameinfo((ip, 0), 0)[0]
+        except Exception as e:
+            box["err"] = e
+        finally:
+            _hostname_slots.release()
+
+    t = threading.Thread(target=work, name="hostname-lookup", daemon=True)
+    try:
+        t.start()
+    except Exception:
+        _hostname_slots.release()  # work() never ran, so never released it
+        raise
+    t.join(timeout)
+    if "err" in box:
+        raise box["err"]
+    return box.get("name")
 
 
 def _resolve_hostname(ip: str) -> str:
@@ -525,27 +576,34 @@ def _resolve_hostname(ip: str) -> str:
     # one-shot --trust-all-devices CLI path, which runs before any other
     # thread starts), so this plain dict cache needs no lock.
     cached = _hostname_cache.get(ip)
-    if cached is not None and time.monotonic() - cached[0] < _HOSTNAME_CACHE_TTL:
+    if cached is not None and time.monotonic() - cached[0] < cached[2]:
         return cached[1]
-    # socket.getnameinfo() has no per-call timeout parameter; on a LAN with
-    # no reverse DNS this can block for many seconds per lookup, and since
-    # ARPPassiveThread resolves every newly-seen MAC before acquiring the
-    # state lock again, that stalls the whole thread (and delays its next
-    # ARP_REFRESH cycle) for as long as the resolver takes. Bound it with the
-    # socket module's global default timeout, the only mechanism getnameinfo
-    # respects — safe here since this is the sole call site that ever sets it.
-    old_timeout = socket.getdefaulttimeout()
+    # socket.getnameinfo() is a blocking libc call with no timeout of its own
+    # — socket.setdefaulttimeout() only governs socket *objects*, so the old
+    # attempt to bound it that way did nothing. On a LAN with no reverse DNS a
+    # lookup can block for many seconds, stalling ARPPassiveThread's whole
+    # cycle. Run it on a worker thread and stop waiting after
+    # _HOSTNAME_TIMEOUT; a lookup that times out is cached as the bare IP for
+    # a short while so it's retried later rather than re-blocking every cycle.
+    ttl = _HOSTNAME_CACHE_TTL
     try:
-        socket.setdefaulttimeout(1.5)
-        name = socket.getnameinfo((ip, 0), 0)[0]
-        result = name if name != ip else ip
+        name = _getnameinfo_bounded(ip, _HOSTNAME_TIMEOUT)
+        if name:
+            result = name
+        else:
+            result, ttl = ip, _HOSTNAME_RETRY_AFTER
     except Exception as e:
         _note("_resolve_hostname", e)
-        result = ip
-    finally:
-        socket.setdefaulttimeout(old_timeout)
-    _hostname_cache[ip] = (time.monotonic(), result)
+        result, ttl = ip, _HOSTNAME_RETRY_AFTER
+    _hostname_cache[ip] = (time.monotonic(), result, ttl)
     return result
+
+
+def _name_or_none(hostname, ip):
+    """A resolved hostname worth remembering, or None when resolution just
+    fell back to the IP — so a failed reverse lookup never overwrites a real
+    name already stored in known_devices.json with a bare address."""
+    return hostname if hostname and hostname != ip else None
 
 
 def _device_status(dev: DeviceInfo) -> str:
@@ -599,13 +657,15 @@ class SystemThread(threading.Thread):
     def run(self):
         while not self._stop_event.is_set():
             try:
-                # collect() appends to self._metrics.hist's deques, so it must
-                # run under the same lock get_state() uses to snapshot them —
-                # otherwise a reader can iterate a deque while this thread is
-                # mid-append and crash with "deque mutated during iteration".
+                # Sampling (slow: subprocesses, a walk of every process) runs
+                # unlocked; only the history appends and the publish below
+                # need the lock get_state() snapshots under — otherwise a
+                # reader could iterate a deque mid-append and crash with
+                # "deque mutated during iteration".
+                snap = self._metrics.collect()
+                self._check_temp_alert(snap)
                 with _state_lock:
-                    snap = self._metrics.collect()
-                    self._check_temp_alert(snap)
+                    self._metrics.record(snap)
                     _state["system"]      = snap
                     _state["system_hist"] = self._metrics.hist
                     _state["model"]       = self._metrics.model
@@ -635,7 +695,23 @@ class ARPPassiveThread(threading.Thread):
         self._net_id        = None
         self._net_known     = False  # was self._net_id already in the allowlist when detected
         self._baseline_until = 0.0
-        self._dirty          = False
+        self._dirty          = False  # unsaved change of any kind
+        self._dirty_new      = False  # ...that adds a MAC (saved promptly)
+        self._last_save      = 0.0
+        # Guards self._known/_net_known/_baseline_until/_dirty*: trust_all()
+        # runs on the UI thread while run() mutates the same allowlist, and
+        # without this a save()'s prune — which *replaces* self._known —
+        # could land mid-trust and silently drop every device just trusted.
+        # Reentrant because trust_all() may call _refresh_network_identity().
+        # Lock order: this lock first, then _state_lock.
+        self._known_lock = threading.RLock()
+
+    # Refreshing last_seen on an already-known device is the only change most
+    # cycles make; writing known_devices.json for it every ARP_REFRESH (2s)
+    # meant ~43,000 rewrites a day — real wear on a Pi's SD card for a
+    # timestamp only consulted by the 90-day retention prune. Those writes are
+    # batched to this interval; anything that adds a device saves immediately.
+    _LAST_SEEN_SAVE_INTERVAL = 300.0
 
     def _parse_arp_table(self):
         result = {}
@@ -662,6 +738,10 @@ class ARPPassiveThread(threading.Thread):
             _note("ARPPassiveThread._refresh_network_identity", e)
             nets = []
         net_id = known_devices.network_identity(nets)
+        with self._known_lock:
+            return self._apply_network_identity(net_id, now)
+
+    def _apply_network_identity(self, net_id, now):
         if net_id != self._net_id:
             self._net_id = net_id
             # Cached at the moment this network is detected, not re-derived
@@ -694,6 +774,8 @@ class ARPPassiveThread(threading.Thread):
             }
 
     def _save(self, now):
+        # Callers hold self._known_lock (or own the instance outright, as the
+        # one-shot CLI paths do).
         self._known = known_devices.prune(self._known, KNOWN_DEVICES_RETENTION_DAYS, now)
         if known_devices.save(self._known, KNOWN_DEVICES_PATH):
             # Written under sudo it would otherwise be root-owned inside the
@@ -705,26 +787,34 @@ class ARPPassiveThread(threading.Thread):
             # sensor hiccup — surface it rather than letting [t] look like it
             # worked while nothing is ever remembered across runs.
             _note(f"known_devices.save (allowlist not persisted to {KNOWN_DEVICES_PATH})")
-        self._dirty = False
+        self._dirty = self._dirty_new = False
+        self._last_save = now
+
+    def _maybe_save(self, now):
+        if self._dirty_new or (
+                self._dirty and now - self._last_save >= self._LAST_SEEN_SAVE_INTERVAL):
+            self._save(now)
 
     def trust_all(self):
         """Mark every device currently listed on the NETWORK tab as known on
         the current network, and clear any INTRUDER flags. Called from the
         TUI key binding and (via a fresh instance) --trust-all-devices."""
-        now    = time.time()
-        net_id = self._net_id or self._refresh_network_identity(now)
-        with _state_lock:
-            snapshot = list(_state["devices"].items())
-        for mac, dev in snapshot:
-            known_devices.remember(self._known, net_id, mac, dev.hostname, now)
-        with _state_lock:
-            for dev in _state["devices"].values():
-                if dev.status == "INTRUDER":
-                    dev.status = "Active"
-        # This network is now known, whatever scan mode is in effect — the
-        # explicit trust action is what "known" mode is waiting for.
-        self._net_known = True
-        self._save(now)
+        now = time.time()
+        with self._known_lock:
+            net_id = self._net_id or self._refresh_network_identity(now)
+            with _state_lock:
+                snapshot = list(_state["devices"].items())
+            for mac, dev in snapshot:
+                known_devices.remember(self._known, net_id, mac,
+                                       _name_or_none(dev.hostname, dev.ip), now)
+            with _state_lock:
+                for dev in _state["devices"].values():
+                    if dev.status == "INTRUDER":
+                        dev.status = "Active"
+            # This network is now known, whatever scan mode is in effect — the
+            # explicit trust action is what "known" mode is waiting for.
+            self._net_known = True
+            self._save(now)
         self._publish_network_meta()
 
     def run(self):
@@ -746,40 +836,63 @@ class ARPPassiveThread(threading.Thread):
                              for mac in new_macs}
                 # Phase 3: re-acquire the lock to insert the new devices and
                 # refresh existing ones.
-                with _state_lock:
-                    devices = _state["devices"]
-                    for mac, info in parsed.items():
-                        hostname = hostnames.get(mac, info["ip"])
-                        if mac not in devices:
-                            # Still new after the gap — classify it.
-                            known    = known_devices.is_known(self._known, net_id, mac)
-                            baseline = now < self._baseline_until
-                            if known or baseline or not INTRUDER_ALERTS:
-                                status = "Active"
-                                known_devices.remember(self._known, net_id, mac, hostname, now)
-                                self._dirty = True
+                with self._known_lock:
+                    with _state_lock:
+                        devices = _state["devices"]
+                        for mac, info in parsed.items():
+                            hostname = hostnames.get(mac, info["ip"])
+                            if mac not in devices:
+                                # Still new after the gap — classify it.
+                                known    = known_devices.is_known(self._known, net_id, mac)
+                                baseline = now < self._baseline_until
+                                if known or baseline or not INTRUDER_ALERTS:
+                                    status = "Active"
+                                    known_devices.remember(
+                                        self._known, net_id, mac,
+                                        _name_or_none(hostname, info["ip"]), now)
+                                    self._dirty = True
+                                    self._dirty_new = self._dirty_new or not known
+                                else:
+                                    status = "INTRUDER"
+                                    push_alert(f"INTRUDER: {mac} at {info['ip']}")
+                                devices[mac] = DeviceInfo(
+                                    ip=info["ip"], mac=mac, hostname=hostname,
+                                    first_seen=now, last_seen=now, status=status,
+                                )
                             else:
-                                status = "INTRUDER"
-                                push_alert(f"INTRUDER: {mac} at {info['ip']}")
-                            devices[mac] = DeviceInfo(
-                                ip=info["ip"], mac=mac, hostname=hostname,
-                                first_seen=now, last_seen=now, status=status,
-                            )
-                        else:
-                            # Either pre-existing, or it raced in between the two
-                            # lock acquisitions — just update it.
-                            dev           = devices[mac]
-                            dev.ip        = info["ip"]
-                            dev.last_seen = now
-                            dev.status    = _device_status(dev)
-                            if known_devices.is_known(self._known, net_id, mac):
-                                known_devices.remember(self._known, net_id, mac, hostname, now)
-                                self._dirty = True
-                if self._dirty:
-                    self._save(now)
+                                # Either pre-existing, or it raced in between the two
+                                # lock acquisitions — just update it.
+                                dev           = devices[mac]
+                                dev.ip        = info["ip"]
+                                dev.last_seen = now
+                                dev.status    = _device_status(dev)
+                                if known_devices.is_known(self._known, net_id, mac):
+                                    # dev.hostname, not `hostname`: only new MACs
+                                    # are resolved each cycle, so `hostname` is
+                                    # just the bare IP here and used to overwrite
+                                    # the name remembered in known_devices.json.
+                                    known_devices.remember(
+                                        self._known, net_id, mac,
+                                        _name_or_none(dev.hostname, dev.ip), now)
+                                    self._dirty = True
+                        # A device that has dropped out of the ARP table is never
+                        # touched by the loop above, so it used to keep whatever
+                        # status it last had — "Active" forever, next to a "3h
+                        # ago" LAST SEEN. Age every absent device here too.
+                        for mac, dev in devices.items():
+                            if mac not in parsed:
+                                dev.status = _device_status(dev)
+                    self._maybe_save(now)
             except Exception as e:
                 _note("ARPPassiveThread.run", e)
             self._stop_event.wait(ARP_REFRESH)
+        # Flush the batched last_seen refreshes on a clean shutdown.
+        try:
+            with self._known_lock:
+                if self._dirty:
+                    self._save(time.time())
+        except Exception as e:
+            _note("ARPPassiveThread.run (final save)", e)
 
     def stop(self):
         self._stop_event.set()
@@ -925,7 +1038,6 @@ class PingSweepThread(threading.Thread):
     _KNOWN_MODE_POLL = 5.0
 
     def run(self):
-        self._networks = self._detect_networks()
         while not self._stop_event.is_set():
             if not self._should_scan():
                 wait = (self._KNOWN_MODE_POLL
@@ -934,6 +1046,11 @@ class PingSweepThread(threading.Thread):
                 self._stop_event.wait(wait)
                 continue
             try:
+                # Re-detected every cycle, not once at startup: on a laptop
+                # that changes networks (or a Pi whose DHCP lease arrives
+                # after syswatch starts) a one-time detection kept sweeping
+                # the old subnet — or the SCAN_SUBNET fallback — forever.
+                self._networks = self._detect_networks()
                 ips   = self._all_ips()
                 delay = PING_CYCLE / max(1, len(ips) / PING_BATCH)
                 for i in range(0, len(ips), PING_BATCH):
@@ -1207,12 +1324,20 @@ class StorageThread(threading.Thread):
 
     @staticmethod
     def _fs_stats(path):
+        # Same arithmetic as `df` and psutil.disk_usage() (which the SYSTEM
+        # tab and syswatch-logger use). The old `used = total - f_bavail`
+        # counted the root-reserved blocks (5% by default on ext4, often far
+        # more on thin-provisioned/quota'd volumes) as used, so the STORAGE
+        # tab, --report and the disk alerts could disagree wildly with the
+        # SYSTEM tab and df — e.g. 88% here vs 22% there for the same disk —
+        # and fire false WARNING/CRITICAL alerts.
         try:
             st    = os.statvfs(path)
             total = st.f_blocks * st.f_frsize
             free  = st.f_bavail * st.f_frsize
-            used  = total - free
-            pct   = used / total * 100 if total else 0.0
+            used  = (st.f_blocks - st.f_bfree) * st.f_frsize
+            avail_total = used + free
+            pct   = used / avail_total * 100 if avail_total else 0.0
             return {"total": total, "used": used, "free": free, "pct": pct}
         except Exception as e:
             _note("StorageThread._fs_stats", e)
@@ -1231,6 +1356,8 @@ class StorageThread(threading.Thread):
                 "writes":         int(fields[4]),
                 "write_sectors":  int(fields[6]),
             }
+        except FileNotFoundError:
+            return None  # not a block device (overlay/network root) — absent
         except Exception as e:
             _note("StorageThread._io_stats", e)
             return None
@@ -1284,13 +1411,21 @@ class StorageThread(threading.Thread):
             try:
                 r    = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
                 data = json.loads(r.stdout)
-                passed = data.get("smart_status", {}).get("passed")
+                if not isinstance(data, dict):
+                    raise json.JSONDecodeError("not a JSON object", r.stdout, 0)
+                # smartctl emits explicit nulls for sections it couldn't read
+                # (e.g. "ata_smart_attributes": null), so .get(key, {}) alone
+                # isn't enough — a None there raised AttributeError, which
+                # threw away everything already parsed for this device.
+                smart_status = data.get("smart_status")
+                passed = (smart_status.get("passed")
+                          if isinstance(smart_status, dict) else None)
                 if passed is True:
                     result["health"] = "PASSED"
                 elif passed is False:
                     result["health"] = "FAILED"
                 nvme_log = data.get("nvme_smart_health_information_log")
-                if nvme_log:
+                if isinstance(nvme_log, dict):
                     if "percentage_used" in nvme_log:
                         used = nvme_log["percentage_used"]
                         result["attrs"].append({"name": "Percentage_Used", "value": used})
@@ -1301,9 +1436,14 @@ class StorageThread(threading.Thread):
                     if nvme_log.get("media_errors"):
                         result["attrs"].append(
                             {"name": "Media_Errors", "value": nvme_log["media_errors"]})
-                for attr in data.get("ata_smart_attributes", {}).get("table", []):
-                    name = attr.get("name", "")
-                    raw  = attr.get("raw", {}).get("value", 0)
+                ata_attrs = data.get("ata_smart_attributes")
+                table = ata_attrs.get("table") if isinstance(ata_attrs, dict) else None
+                for attr in table or []:
+                    if not isinstance(attr, dict):
+                        continue
+                    name = attr.get("name") or ""
+                    raw  = attr.get("raw")
+                    raw  = raw.get("value", 0) if isinstance(raw, dict) else 0
                     if name == "Power_On_Hours":
                         result["power_on_hours"] = raw
                     if any(k in name for k in ("Error", "Bad_Block", "Wear")):
@@ -1448,10 +1588,12 @@ class BackupStatusThread(threading.Thread):
                     data = None
                 with _state_lock:
                     _state["backup"] = data
+            except FileNotFoundError:
+                # Installed but never run yet — the tab says so. Not an error:
+                # noting it every 15s kept the header's degraded ⚠ lit.
+                with _state_lock:
+                    _state["backup"] = None
             except Exception as e:
-                # FileNotFoundError (no project-backup installed) is the
-                # overwhelmingly common case here and not a bug — dedup in
-                # note_error() keeps it from spamming debug.log every cycle.
                 _note("BackupStatusThread.run", e)
                 with _state_lock:
                     _state["backup"] = None
@@ -1472,7 +1614,7 @@ class FullRenderer:
         curses.curs_set(0)
         win.timeout(100)
         win.keypad(True)
-        self._hist_cache = None  # (loaded_at: float, rows: list)
+        self._hist_cache = None  # (checked_at: float, rows: list, file_sig)
         self.hist_scroll_max = 0  # highest valid Tab 7 scroll offset (charts)
 
     # ── primitives ────────────────────────────────────────────────────────────
@@ -2173,8 +2315,13 @@ class FullRenderer:
             except (ValueError, TypeError):
                 rest_str, rest_c = "N/A", cp(CP_DIM)
             pid_str = pid if pid not in ("0", "") else "-"
-            line = (f"{unit:<16}  {active:<10}  {sub:<10}  "
-                    f"{pid_str:>7}  {rest_str:>8}  {since_str:<16}  {result}")
+            # Every field before RESTARTS is clipped to its column: the
+            # restart count is re-drawn in its own colour at the fixed
+            # _REST_X, so a longer unit ("systemd-networkd-wait-online") or
+            # state ("deactivating", "auto-restart") shifted the row and that
+            # overlay then landed on top of the PID/state text.
+            line = (f"{unit[:16]:<16}  {active[:10]:<10}  {sub[:10]:<10}  "
+                    f"{pid_str[:7]:>7}  {rest_str:>8}  {since_str:<16}  {result}")
             self._add(row, 0, line[:W], c)
             self._add(row, _REST_X, f"{rest_str:>8}", rest_c)
             row += 1
@@ -2518,9 +2665,22 @@ class FullRenderer:
         if (self._hist_cache is not None
                 and now - self._hist_cache[0] < self._HIST_TTL):
             return self._hist_cache[1]
+        path = self._hist_csv_path()
+        # Parsing a month of samples (~20k rows) takes long enough on a Pi to
+        # stutter the UI, and this runs on the render thread — so only
+        # re-parse when the file actually changed since the last load.
+        try:
+            st  = os.stat(path)
+            sig = (st.st_mtime_ns, st.st_size, st.st_ino)
+        except OSError:
+            sig = None
+        if (self._hist_cache is not None and sig is not None
+                and self._hist_cache[2] == sig):
+            self._hist_cache = (now, self._hist_cache[1], sig)
+            return self._hist_cache[1]
         rows = []
         try:
-            with open(self._hist_csv_path()) as f:
+            with open(path) as f:
                 for line in f:
                     line = line.strip()
                     if not line:
@@ -2545,18 +2705,20 @@ class FullRenderer:
                         "storage_temp":  self._col(parts, 7),
                         "battery_pct":   self._col(parts, 8),
                     })
+        except FileNotFoundError:
+            # No metrics.csv yet (logger not installed/started) — the tab
+            # already says so. Recording it as an error re-lit the header's
+            # degraded ⚠ on every reload, i.e. permanently while on this tab.
+            pass
         except Exception as e:
-            # FileNotFoundError (no metrics.csv yet) is the overwhelmingly
-            # common case and not a bug, but this is also the only place
-            # that would ever surface e.g. a PermissionError on the file, so
-            # it's still worth a (deduplicated) record.
+            # e.g. a PermissionError on the file — worth a (deduplicated) record.
             _note("FullRenderer._load_history", e)
         # _render_history assumes chronological order (filtered[0]/[-1] as the
         # oldest/newest bound of the resample grid); an out-of-order CSV — clock
         # adjustments, concatenated files, manual edits — would otherwise send
         # the bin-index math negative and crash with an IndexError.
         rows.sort(key=lambda r: r["ts"])
-        self._hist_cache = (now, rows)
+        self._hist_cache = (now, rows, sig)
         return rows
 
     def _render_history(self, history_window, history_scroll=0):
@@ -2789,7 +2951,7 @@ class FullRenderer:
                     # push the time labels off the panel.
                     if row + 1 < cy + ch:
                         tick_chars = [" "] * data_w
-                        for col, text in kept:
+                        for col, _text in kept:
                             centre = col + label_w // 2
                             if 0 <= centre < data_w:
                                 tick_chars[centre] = "│"
@@ -2932,7 +3094,7 @@ def _curses_main(stdscr, args, cfg_errors=None):
                 log_filter, mode, filter_buf = filter_buf, "normal", ""
                 curses.curs_set(0)
                 last_render = 0.0
-            elif ch in (curses.KEY_BACKSPACE, 127):
+            elif ch in (curses.KEY_BACKSPACE, 127, 8):
                 filter_buf = filter_buf[:-1]
                 last_render = 0.0
             elif 32 <= ch <= 126:
@@ -3099,7 +3261,8 @@ def _cli_trust_all_devices():
     parsed = arp._parse_arp_table()
     for mac, info in parsed.items():
         hostname = _resolve_hostname(info["ip"])
-        known_devices.remember(arp._known, net_id, mac, hostname, now)
+        known_devices.remember(arp._known, net_id, mac,
+                               _name_or_none(hostname, info["ip"]), now)
     arp._save(now)
     print(f"Trusted {len(parsed)} device(s) on network '{net_id}'. "
           f"Saved to {KNOWN_DEVICES_PATH}")

@@ -7,6 +7,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 UNATTENDED=0
 SKIP_CONFIG=0
+TARGET_USER=""
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -20,14 +21,19 @@ check_python3() {
     command -v python3 >/dev/null 2>&1 || die "python3 is not available. Please install Python 3."
 }
 
-# Resolves the human behind `sudo` (falling back to 'lukas' if run as plain
-# root with no SUDO_USER) and their home directory — used both for the
-# syswatch-logger systemd service's User= and for where config.toml gets
+# Resolves the user syswatch is installed for — --user NAME if given,
+# otherwise the human behind `sudo` — and their home directory, used both for
+# the syswatch-logger systemd service's User= and for where config.toml gets
 # written. Deliberately not $HOME: sudo commonly resets HOME to root's when
 # env_reset is on, so trusting $HOME here would write root's config instead
-# of the invoking user's.
+# of the invoking user's. Run as plain root (no SUDO_USER) without --user,
+# there is no one to pick: refuse rather than guess a username that most
+# likely doesn't exist on this machine.
 resolve_install_target() {
-    INSTALL_USER="${SUDO_USER:-lukas}"
+    INSTALL_USER="${TARGET_USER:-${SUDO_USER:-}}"
+    if [[ -z "$INSTALL_USER" ]]; then
+        die "Cannot tell which user to install for. Run via 'sudo' from your own account, or pass --user NAME (use --user root to run the logger as root)."
+    fi
     # The `|| true` keeps a lookup failure (nonexistent user) from tripping
     # `set -e`/pipefail right here, silently killing the script before the
     # explicit check below gets a chance to report it properly.
@@ -434,6 +440,9 @@ Usage: $0 [OPTIONS]
                     defaults. Implied automatically for non-interactive runs.
   --skip-config     Do not write a config.toml at all (today's behaviour —
                     generate one later with 'syswatch --write-default-config').
+  --user NAME       Install for this user (logger service User=, config
+                    location) instead of the one behind sudo. Required
+                    when running as plain root without sudo.
   --uninstall       Remove syswatch. Leaves ~/.config/syswatch/ and
                     ~/.local/share/syswatch/ (config, metrics, known devices)
                     in place.
@@ -444,14 +453,21 @@ USAGE
 # ── dispatch ──────────────────────────────────────────────────────────────────
 
 ACTION="install"
-for arg in "$@"; do
-    case "$arg" in
+while [[ $# -gt 0 ]]; do
+    case "$1" in
         --uninstall)   ACTION="uninstall" ;;
         --unattended)  UNATTENDED=1 ;;
         --skip-config) SKIP_CONFIG=1 ;;
+        --user)
+            [[ $# -ge 2 && -n "$2" ]] || die "--user needs a username"
+            TARGET_USER="$2"
+            shift
+            ;;
+        --user=*)      TARGET_USER="${1#--user=}" ;;
         -h|--help)     ACTION="help" ;;
-        *) die "Unknown argument: $arg  Usage: $0 [--unattended] [--skip-config] [--uninstall]" ;;
+        *) die "Unknown argument: $1  Usage: $0 [--unattended] [--skip-config] [--user NAME] [--uninstall]" ;;
     esac
+    shift
 done
 
 case "$ACTION" in
