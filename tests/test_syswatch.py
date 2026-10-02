@@ -64,6 +64,21 @@ class HelperFunctionTests(unittest.TestCase):
         self.assertEqual(st._device_status(dev), "Idle")
 
 
+class FilterPromptTests(unittest.TestCase):
+    def type_keys(self, keys, log_filter=""):
+        editing, buf = True, log_filter  # "/" starts from the applied filter
+        for ch in keys:
+            editing, buf, log_filter = sw.filter_prompt_key(ch, buf, log_filter)
+        return editing, buf, log_filter
+
+    def test_enter_applies_and_backspace_or_ctrl_h_delete(self):
+        keys = [ord(c) for c in "sysxx"] + [127, 8] + [ord(c) for c in "tem"] + [10]
+        self.assertEqual(self.type_keys(keys), (False, "", "system"))
+
+    def test_esc_clears_the_applied_filter(self):
+        self.assertEqual(self.type_keys([27], log_filter="system"), (False, "", ""))
+
+
 class FsStatsTests(unittest.TestCase):
     def test_matches_df_and_psutil(self):
         fs = col.StorageThread._fs_stats("/")
