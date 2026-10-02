@@ -209,6 +209,21 @@ class InstallerTests(unittest.TestCase):
         self.assertFalse(os.path.exists(os.path.dirname(self.config)))
         self.assertFalse(os.path.exists(self.data))
 
+    def test_uninstall_offers_config_backups(self):
+        # "Replace" saves config.toml.bak-*; uninstall used to ask only about
+        # config.toml, so the backups were left behind without a word.
+        self.assertEqual(self.run_unattended()[0], 0)
+        backup = self.config + ".bak-20260101-000000"
+        self.put(backup, "[ui]\nrefresh = 2.0\n", self.user)
+        code, out = self.run_interactive(["--uninstall"], ["", "n"])
+        self.assertEqual(code, 0, out)
+        self.assertIn("config.toml.bak-20260101-000000: config backup", out)
+        self.assertFalse(os.path.exists(backup))
+        self.assertTrue(os.path.exists(self.config))
+        code, out = self.run_interactive(["--uninstall"], ["n"])
+        self.assertEqual(code, 0, out)
+        self.assertFalse(os.path.exists(os.path.dirname(self.config)))
+
     def test_purge_without_uninstall_is_rejected(self):
         code, out = self.run_unattended("--purge")
         self.assertNotEqual(code, 0)

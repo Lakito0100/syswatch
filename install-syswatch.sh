@@ -213,9 +213,11 @@ ensure_psutil() {
 # review_data_dir DIR TITLE — one-line summary of every file in DIR and a
 # keep (default) / delete question each.
 review_data_dir() {
-    local dir="$1" title="$2" files f
+    local dir="$1" title="$2" skip="${3:-}" files=() f
     [[ -d "$dir" ]] || return 0
-    mapfile -t files < <(inventory files "$dir")
+    while IFS= read -r f; do
+        [[ -n "$skip" && "$(basename -- "$f")" == "$skip" ]] || files+=("$f")
+    done < <(inventory files "$dir")
     (( ${#files[@]} )) || return 0
     echo "  $title ($dir):"
     for f in "${files[@]}"; do
@@ -226,6 +228,17 @@ review_data_dir() {
         fi
     done
     rmdir --ignore-fail-on-non-empty "$dir" 2>/dev/null || true
+}
+
+# review_config_dir DIR — config.toml, then every other file in DIR: the
+# config.toml.bak-* copies a "replace" saves were otherwise never offered for
+# deletion, so they outlived an uninstall unless --purge was used.
+review_config_dir() {
+    local dir="$1"
+    if [[ -f "$dir/config.toml" ]]; then
+        review_config_for_removal "$dir/config.toml" || true
+    fi
+    review_data_dir "$dir" "Other config files" config.toml
 }
 
 # review_config_for_removal PATH — summary + keep (default) / delete.
@@ -281,15 +294,13 @@ handle_config() {
 review_root_leftovers() {
     [[ "$INSTALL_USER" == "root" ]] && return 0
     [[ "$(realpath -m "$ROOT_HOME")" == "$(realpath -m "$INSTALL_HOME")" ]] && return 0
-    local cfg="$ROOT_HOME/.config/syswatch/config.toml"
+    local cfg_dir="$ROOT_HOME/.config/syswatch"
     local data="$ROOT_HOME/.local/share/syswatch"
-    [[ -f "$cfg" || -d "$data" ]] || return 0
+    [[ -d "$cfg_dir" || -d "$data" ]] || return 0
     echo ""
     echo "  Found syswatch files in root's home — most likely left by running an older"
     echo "  version with sudo. syswatch $NEW_VERSION uses $INSTALL_USER's files even under sudo."
-    if [[ -f "$cfg" ]]; then
-        review_config_for_removal "$cfg" || true
-    fi
+    review_config_dir "$cfg_dir"
     review_data_dir "$data" "Data"
 }
 
@@ -647,13 +658,11 @@ purge_user_files() {
 
 review_user_files() {
     local home="$1" title="$2"
-    local cfg="$home/.config/syswatch/config.toml"
-    [[ -f "$cfg" || -d "$home/.local/share/syswatch" ]] || return 0
+    local cfg_dir="$home/.config/syswatch"
+    [[ -d "$cfg_dir" || -d "$home/.local/share/syswatch" ]] || return 0
     echo ""
     echo "$title"
-    if [[ -f "$cfg" ]]; then
-        review_config_for_removal "$cfg" || true
-    fi
+    review_config_dir "$cfg_dir"
     review_data_dir "$home/.local/share/syswatch" "Data"
 }
 
