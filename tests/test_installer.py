@@ -44,7 +44,12 @@ class InstallerTests(unittest.TestCase):
         self.env = dict(os.environ, PATH=stub + ":" + os.environ.get("PATH", ""),
                         SYSWATCH_LIB_DIR=self.lib, SYSWATCH_BIN=self.bin,
                         SYSWATCH_UNIT_DIR=self.units, SYSWATCH_DOC_DIR=self.doc,
-                        SYSWATCH_ROOT_HOME=self.roothome)
+                        SYSWATCH_ROOT_HOME=self.roothome,
+                        # Only the scratch home's ~/.local/bin and ~/bin: on a
+                        # machine with syswatch installed, its real launcher
+                        # added an unexpected "Remove it?" prompt that shifted
+                        # every scripted answer by one.
+                        SYSWATCH_LAUNCHER_DIRS="")
         self.env.pop("SUDO_USER", None)
         self.config = os.path.join(self.home, ".config", "syswatch", "config.toml")
         self.data = os.path.join(self.home, ".local", "share", "syswatch")

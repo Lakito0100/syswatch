@@ -11,6 +11,13 @@ UNIT_DIR="${SYSWATCH_UNIT_DIR:-/etc/systemd/system}"
 DOC_DIR="${SYSWATCH_DOC_DIR:-/usr/share/doc/syswatch}"
 ROOT_HOME="${SYSWATCH_ROOT_HOME:-$(getent passwd root | cut -d: -f6 || true)}"
 ROOT_HOME="${ROOT_HOME:-/root}"
+# Where find_stray_launchers looks besides the target user's ~/.local/bin and
+# ~/bin. Overridable so the tests don't see the real install's launcher.
+if [[ -v SYSWATCH_LAUNCHER_DIRS ]]; then
+    LAUNCHER_DIRS="$SYSWATCH_LAUNCHER_DIRS"
+else
+    LAUNCHER_DIRS="${PATH:-}:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin"
+fi
 SERVICE_DST="$UNIT_DIR/syswatch-logger.service"
 
 UNATTENDED=0
@@ -151,8 +158,7 @@ detect_and_remove_old_install() {
 find_stray_launchers() {
     local dirs=() d f key seen=" " real_bin
     real_bin="$(realpath -m "$BIN_FILE")"
-    IFS=: read -r -a dirs <<< "${PATH:-}"
-    dirs+=("/usr/local/bin" "/usr/bin" "/bin" "/usr/local/sbin")
+    IFS=: read -r -a dirs <<< "$LAUNCHER_DIRS"
     [[ -n "${INSTALL_HOME:-}" ]] && dirs+=("$INSTALL_HOME/.local/bin" "$INSTALL_HOME/bin")
     for d in "${dirs[@]}"; do
         [[ -n "$d" ]] || continue
