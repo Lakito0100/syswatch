@@ -71,6 +71,9 @@ _state = {
     "storage":     None,
     "backup":      None,
     "network_meta": None,  # {"net_id", "known", "scan_mode"} — see ARPPassiveThread
+    # Upper-bound seconds for one full ping-sweep pass while PingSweepThread
+    # is actively sweeping this network, else None — see _recent_window().
+    "sweep_period": None,
 }
 _state_lock = threading.Lock()
 _alerts     = collections.deque(maxlen=5)
@@ -153,12 +156,39 @@ def _name_or_none(hostname, ip):
     return hostname if hostname and hostname != ip else None
 
 
+_RECENT_WINDOW = 300.0
+
+
+def _recent_window():
+    """Seconds since last_seen a device still counts as "Recent".
+
+    A quiet device that only shows up because it answers the sweep is seen
+    once per pass, and a pass takes PING_CYCLE plus the batches' own ping
+    time (~450 s for a /24 at the default 420 s). A fixed 300 s marked every
+    such device Idle for the last third of each pass — on the first pass,
+    devices found early went Idle before the sweep had even finished the
+    subnet. While sweeping, allow two passes, so one lost reply to the
+    single-packet ping doesn't make a live device Idle either.
+
+    Callers hold _state_lock (it isn't reentrant), so this reads _state
+    without taking it."""
+    period = _state.get("sweep_period")
+    if period:
+        return max(_RECENT_WINDOW, 2 * period)
+    return _RECENT_WINDOW
+
+
 def _device_status(dev: DeviceInfo) -> str:
+    window = _recent_window()
     if dev.status == "INTRUDER":
-        return "Idle" if time.time() - dev.last_seen > settings.INTRUDER_TTL else "INTRUDER"
+        # Same reason as above: with INTRUDER_TTL barely longer than one pass,
+        # a single missed ping turned the flag into Idle — for good, since the
+        # status is overwritten and never re-derived as INTRUDER.
+        ttl = max(settings.INTRUDER_TTL, window)
+        return "Idle" if time.time() - dev.last_seen > ttl else "INTRUDER"
     age = time.time() - dev.last_seen
-    if age < 10:   return "Active"
-    if age < 300:  return "Recent"
+    if age < 10:      return "Active"
+    if age < window:  return "Recent"
     return "Idle"
 
 

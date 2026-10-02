@@ -197,7 +197,8 @@ class PingSweepGateTests(_TrustBase):
         p2 = mock.patch.object(st.settings, "PING_CYCLE", 0.2)
         p3 = mock.patch.object(st.settings, "PING_BATCH", 64)
         p4 = mock.patch.object(net.shutil, "which", side_effect=lambda b: f"/usr/bin/{b}")
-        for p in (p1, p2, p3, p4):
+        p5 = mock.patch.dict(st._state, {"sweep_period": None})
+        for p in (p1, p2, p3, p4, p5):
             p.start()
             self.addCleanup(p.stop)
 
@@ -250,6 +251,35 @@ class PingSweepGateTests(_TrustBase):
             self.sweep(network_fn=flaky)
         # Gate + first batch allowed, then the identity changed: at most one batch.
         self.assertLessEqual(len(self.pinged), 10)
+
+    def test_sweep_period_is_published_only_while_sweeping(self):
+        # Device status stretches its "Recent" window by this; a stale value
+        # after the sweep stopped would keep gone devices Recent for too long.
+        self.trust.trust(GW, [CIDR])
+        t = net.PingSweepThread(trust=self.trust, network_fn=self.net)
+        t._GATED_POLL = 0.05
+        t.start()
+        deadline = time.time() + 2
+        while st._state["sweep_period"] is None and time.time() < deadline:
+            time.sleep(0.01)
+        # 254 hosts in batches of 64 → 4 batches on top of PING_CYCLE.
+        self.assertEqual(st._state["sweep_period"],
+                         0.2 + 4 * net.PingSweepThread._BATCH_OVERHEAD)
+        self.trust.untrust(GW)
+        deadline = time.time() + 2
+        while st._state["sweep_period"] is not None and time.time() < deadline:
+            time.sleep(0.01)
+        self.assertIsNone(st._state["sweep_period"])
+        self.trust.trust(GW, [CIDR])
+        time.sleep(0.2)
+        t.stop()
+        t.join(3)
+        self.assertFalse(t.is_alive())
+        self.assertIsNone(st._state["sweep_period"])
+
+    def test_untrusted_network_publishes_no_sweep_period(self):
+        self.sweep()
+        self.assertIsNone(st._state["sweep_period"])
 
     def test_no_fallback_target_without_a_local_subnet(self):
         self.trust.trust(GW, [CIDR])

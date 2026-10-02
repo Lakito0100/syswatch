@@ -653,7 +653,24 @@ class PingSweepThread(threading.Thread):
     # PING_CYCLE — so a freshly confirmed trust starts sweeping promptly.
     _GATED_POLL = 5.0
 
+    # Upper bound on how long one batch's pings take on top of the
+    # inter-batch delay: _ping_batch() waits at most 2 s per process.
+    _BATCH_OVERHEAD = 2.0
+
+    @staticmethod
+    def _publish_period(period):
+        with _state_lock:
+            _state["sweep_period"] = period
+
     def run(self):
+        try:
+            self._run()
+        finally:
+            # A stopped sweep must not leave devices on the stretched
+            # "Recent" window meant for a network that's being swept.
+            self._publish_period(None)
+
+    def _run(self):
         while not self._stop_event.is_set():
             try:
                 nets = self._allowed_networks()
@@ -661,6 +678,7 @@ class PingSweepThread(threading.Thread):
                 _note("PingSweepThread.run (gate)", e)
                 nets = []
             if not nets:
+                self._publish_period(None)
                 wait = (self._GATED_POLL
                         if self._scan_mode == "trusted" and self._binary_available
                         else settings.PING_CYCLE)
@@ -668,7 +686,9 @@ class PingSweepThread(threading.Thread):
                 continue
             try:
                 ips   = [str(h) for net in nets for h in net.hosts()]
+                n_batches = -(-len(ips) // settings.PING_BATCH)
                 delay = settings.PING_CYCLE / max(1, len(ips) / settings.PING_BATCH)
+                self._publish_period(settings.PING_CYCLE + n_batches * self._BATCH_OVERHEAD)
                 for i in range(0, len(ips), settings.PING_BATCH):
                     if self._stop_event.is_set():
                         return
@@ -679,6 +699,7 @@ class PingSweepThread(threading.Thread):
                     batch = [ip for ip in ips[i:i + settings.PING_BATCH]
                              if any(ipaddress.IPv4Address(ip) in n for n in allowed)]
                     if len(batch) != len(ips[i:i + settings.PING_BATCH]):
+                        self._publish_period(None)
                         break
                     alive = self._ping_batch(batch)
                     now   = time.time()

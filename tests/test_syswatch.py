@@ -63,6 +63,24 @@ class HelperFunctionTests(unittest.TestCase):
         dev.last_seen = now - st.settings.INTRUDER_TTL - 1
         self.assertEqual(st._device_status(dev), "Idle")
 
+    def test_device_status_while_sweeping(self):
+        # A sweep pass (~470 s for a /24 at the default 420 s ping_cycle) is
+        # longer than the passive 300 s Recent window, so devices only seen
+        # by the sweep used to go Idle between passes.
+        now = time.time()
+        with mock.patch.dict(st._state, {"sweep_period": 470}):
+            dev = st.DeviceInfo("1.2.3.4", "aa", "h", now, now - 400, "Recent")
+            self.assertEqual(st._device_status(dev), "Recent")
+            dev.last_seen = now - 2 * 470 + 5   # one missed ping is tolerated
+            self.assertEqual(st._device_status(dev), "Recent")
+            dev.last_seen = now - 2 * 470 - 1
+            self.assertEqual(st._device_status(dev), "Idle")
+            dev.status, dev.last_seen = "INTRUDER", now - 700
+            self.assertEqual(st._device_status(dev), "INTRUDER")
+        with mock.patch.dict(st._state, {"sweep_period": None}):
+            dev = st.DeviceInfo("1.2.3.4", "aa", "h", now, now - 400, "Recent")
+            self.assertEqual(st._device_status(dev), "Idle")
+
 
 class FsStatsTests(unittest.TestCase):
     def test_matches_df_and_psutil(self):
