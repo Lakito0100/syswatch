@@ -975,16 +975,20 @@ class FullRenderer:
         mounts = [("/", "fs_root")]
         if boot_mount:
             mounts.append((boot_mount, "fs_boot"))
+        # Pad to the longest mount, not a fixed 7: "/boot/firmware" (Pi) and
+        # "/boot/efi" overflowed it and pushed their numbers and bar out of
+        # line with the "/" row.
+        lbl_w = max(7, *(len(m) for m, _ in mounts))
         for mount, key in mounts:
             if row >= cy + ch:
                 break
             fs = snap.get(key)
             if fs is None:
-                self._add(row, 0, f"{mount:<7}  N/A", cp(CP_DIM))
+                self._add(row, 0, f"{mount:<{lbl_w}}  N/A", cp(CP_DIM))
                 row += 1
                 continue
             pct  = fs["pct"]
-            lbl  = f"{mount:<7} "
+            lbl  = f"{mount:<{lbl_w}} "
             info = f" {fmtb(fs['used']):>8}/{fmtb(fs['total']):<8}  {pct:5.1f}%  "
             bar_x = len(lbl) + len(info)
             bw    = max(4, W - bar_x - 1)
