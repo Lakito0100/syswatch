@@ -441,6 +441,37 @@ def gpu_temp():
     return result
 
 
+def _read_gpu_temp_pi():
+    if not shutil.which("vcgencmd"):
+        return None
+    try:
+        r = subprocess.run(
+            ["vcgencmd", "measure_temp", "pmic"],
+            capture_output=True, text=True, timeout=0.5,
+        )
+    except Exception as e:
+        note_error("_read_gpu_temp_pi", e)
+        return None
+    raw = r.stdout.strip()
+    if r.returncode != 0 or "temp=" not in raw:
+        return None
+    try:
+        return float(raw.split("=")[1].strip("'C "))
+    except ValueError as e:
+        note_error("_read_gpu_temp_pi (parse)", e)
+        return None
+
+
+def gpu_temp_c():
+    """The GPU temperature the TUI shows, in °C, or None. Shared with the
+    logger: gpu_temp() only knows NVIDIA/AMD/Intel, so a logger that used it
+    left the gpu_temp column empty on every Pi while the TUI showed a value."""
+    if is_pi():
+        return _read_gpu_temp_pi()
+    gpu = gpu_temp()
+    return gpu["temp"] if gpu else None
+
+
 # ── storage device / temperature ─────────────────────────────────────────────
 
 _root_device_cache = None

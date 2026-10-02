@@ -58,14 +58,7 @@ class Metrics:
         return sensors.cpu_temp()
 
     def _gpu_temp(self):
-        if sensors.is_pi():
-            raw = self._vcg("measure_temp pmic")
-            if raw and "temp=" in raw:
-                try: return float(raw.split("=")[1].strip("'C "))
-                except Exception as e: _note("Metrics._gpu_temp (parse)", e)
-            return None
-        gpu = sensors.gpu_temp()
-        return gpu["temp"] if gpu else None
+        return sensors.gpu_temp_c()
 
     def _voltage(self):
         raw = self._vcg("measure_volts core")

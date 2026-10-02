@@ -456,6 +456,20 @@ class RenderTests(unittest.TestCase):
         self.assertEqual(row[18:30].strip(), "deactivati")
         self.assertEqual(row[51:59].strip(), "9")
 
+    def test_storage_filesystem_rows_stay_aligned_with_a_long_mount(self):
+        state = self._states()[0]
+        state = dict(state, storage=dict(
+            state["storage"], boot_mount="/boot/firmware",
+            fs_boot={"total": 528592896, "used": 82614272, "free": 0, "pct": 15.6}))
+        win = helpers.FakeWin(30, 120)
+        renderer = rnd.FullRenderer(win, self.tabs)
+        renderer.render(5, state, "", "normal", "", 0, 0)
+        lines = win.text().splitlines()
+        root = next(ln for ln in lines if ln.startswith("/ "))
+        boot = next(ln for ln in lines if ln.startswith("/boot/firmware"))
+        self.assertEqual(root.index("%"), boot.index("%"))
+        self.assertEqual(root.index("["), boot.index("["))
+
     def test_history_cache_reloads_only_on_change(self):
         self._write_history()
         renderer = rnd.FullRenderer(helpers.FakeWin(24, 80), self.tabs)
