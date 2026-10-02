@@ -114,6 +114,22 @@ def build_tabs():
     tabs.append(("history", "HISTORY"))
     return tabs
 
+
+def filter_prompt_key(ch, filter_buf, log_filter):
+    """One key typed into the LOGS filter prompt.
+    Returns (still_editing, filter_buf, log_filter)."""
+    if ch == 27:
+        # Esc clears the applied filter too, not just the prompt: otherwise
+        # there was no way back to the full log except deleting it by hand.
+        return False, "", ""
+    if ch in (curses.KEY_ENTER, 10, 13):
+        return False, "", filter_buf
+    if ch in (curses.KEY_BACKSPACE, 127, 8):
+        return True, filter_buf[:-1], log_filter
+    if 32 <= ch <= 126:
+        return True, filter_buf + chr(ch), log_filter
+    return True, filter_buf, log_filter
+
 # ── entry point ────────────────────────────────────────────────────────────────
 def _curses_main(stdscr, args, cfg_errors=None):
     init_colors()
@@ -226,21 +242,12 @@ def _curses_main(stdscr, args, cfg_errors=None):
             if closed:
                 mode = "normal"
                 last_render = 0.0
-        elif mode == "filter_input":
-            if ch == 27:
-                mode, filter_buf = "normal", ""
+        elif mode == "filter_input" and ch != -1:
+            editing, filter_buf, log_filter = filter_prompt_key(ch, filter_buf, log_filter)
+            if not editing:
+                mode = "normal"
                 curses.curs_set(0)
-                last_render = 0.0
-            elif ch in (curses.KEY_ENTER, 10, 13):
-                log_filter, mode, filter_buf = filter_buf, "normal", ""
-                curses.curs_set(0)
-                last_render = 0.0
-            elif ch in (curses.KEY_BACKSPACE, 127, 8):
-                filter_buf = filter_buf[:-1]
-                last_render = 0.0
-            elif 32 <= ch <= 126:
-                filter_buf += chr(ch)
-                last_render = 0.0
+            last_render = 0.0
 
         now = time.monotonic()
         if now - last_render >= settings.REFRESH:
