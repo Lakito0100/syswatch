@@ -184,7 +184,7 @@ def main():
             temp  = sensors.cpu_temp()
             disk  = psutil.disk_usage("/").percent
             volt  = _core_voltage()
-            gtemp = sensors.gpu_temp()
+            gtemp = sensors.gpu_temp_c()
             stemp = sensors.storage_temp()
             try:
                 batt = psutil.sensors_battery()
@@ -196,7 +196,7 @@ def main():
             # 4 decimals: core voltage moves in ~0.0125V steps, .1f would
             # collapse the whole series to one flat value.
             volt_str  = f"{volt:.4f}" if volt is not None else ""
-            gtemp_str = f"{gtemp['temp']:.1f}" if gtemp is not None else ""
+            gtemp_str = f"{gtemp:.1f}" if gtemp is not None else ""
             stemp_str = f"{stemp:.1f}" if stemp is not None else ""
             batt_str  = f"{batt.percent:.1f}" if batt is not None else ""
             line = (f"{ts},{cpu:.1f},{mem:.1f},{temp_str},{disk:.1f},"
