@@ -63,6 +63,31 @@ class HelperFunctionTests(unittest.TestCase):
         dev.last_seen = now - st.settings.INTRUDER_TTL - 1
         self.assertEqual(st._device_status(dev), "Idle")
 
+    def test_device_status_while_sweeping(self):
+        # A sweep pass (~470 s for a /24 at the default 420 s ping_cycle) is
+        # longer than the passive 300 s Recent window, so devices only seen
+        # by the sweep used to go Idle between passes.
+        now = time.time()
+
+        def status(age, scan, was="Recent"):
+            dev = st.DeviceInfo("1.2.3.4", "aa", "h", now, now - age, was)
+            with mock.patch.dict(st._state, {"scan_status": scan}), \
+                 mock.patch.object(st.settings, "PING_CYCLE", 420):
+                return st._device_status(dev)
+
+        # Before the first sweep completes, cycle_s is the nominal 420 s; the
+        # estimate adds 2 s for each of the 26 batches: 472 s, so 944 s.
+        first = _fake_scan_status(cycle_s=420.0, last_done_at=None)
+        self.assertEqual(status(400, first), "Recent")
+        self.assertEqual(status(940, first), "Recent")   # one missed ping
+        self.assertEqual(status(950, first), "Idle")
+        self.assertEqual(status(700, first, "INTRUDER"), "INTRUDER")
+        # A measured sweep slower than the estimate wins.
+        self.assertEqual(status(1100, _fake_scan_status(cycle_s=600.0)), "Recent")
+        # Not sweeping (stopped, gated or never trusted): plain 300 s.
+        self.assertEqual(status(400, _fake_scan_status(active=False)), "Idle")
+        self.assertEqual(status(400, None), "Idle")
+
 
 class FilterPromptTests(unittest.TestCase):
     def type_keys(self, keys, log_filter=""):
