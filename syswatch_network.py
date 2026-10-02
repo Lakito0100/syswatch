@@ -575,6 +575,12 @@ class PingSweepThread(threading.Thread):
         self._binary_available = self._ping_path is not None
         if not self._binary_available and scan_mode == "trusted":
             _note("PingSweepThread.__init__ (ping not found)")
+        # The last *completed* sweep, kept here because the published status
+        # dict is replaced on every update. None until one has finished.
+        self._last_done_at   = None
+        self._last_replied   = None
+        self._last_duration  = None
+        self._published_active = None
 
     def _allowed_networks(self):
         """The subnets it's permitted to ping right now, or [] for none."""
@@ -653,6 +659,26 @@ class PingSweepThread(threading.Thread):
     # PING_CYCLE — so a freshly confirmed trust starts sweeping promptly.
     _GATED_POLL = 5.0
 
+    def _publish(self, active, hosts_total=0, hosts_done=0, next_batch_at=None):
+        """Progress for the NETWORK tab, which otherwise had no way to show
+        when or how often pings go out. A fresh dict every time (see
+        _state["scan_status"]); cheap, so fine under the lock."""
+        status = {
+            "active":        active,
+            "hosts_total":   hosts_total,
+            "hosts_done":    hosts_done,
+            "batch_size":    settings.PING_BATCH,
+            "next_batch_at": next_batch_at,
+            # Measured, not the nominal PING_CYCLE: the time spent waiting on
+            # the pings themselves makes a real sweep take longer.
+            "cycle_s":       self._last_duration or settings.PING_CYCLE,
+            "last_done_at":  self._last_done_at,
+            "last_replied":  self._last_replied,
+        }
+        with _state_lock:
+            _state["scan_status"] = status
+        self._published_active = active
+
     def run(self):
         while not self._stop_event.is_set():
             try:
@@ -661,6 +687,8 @@ class PingSweepThread(threading.Thread):
                 _note("PingSweepThread.run (gate)", e)
                 nets = []
             if not nets:
+                if self._published_active is not False:
+                    self._publish(False)
                 wait = (self._GATED_POLL
                         if self._scan_mode == "trusted" and self._binary_available
                         else settings.PING_CYCLE)
@@ -669,6 +697,8 @@ class PingSweepThread(threading.Thread):
             try:
                 ips   = [str(h) for net in nets for h in net.hosts()]
                 delay = settings.PING_CYCLE / max(1, len(ips) / settings.PING_BATCH)
+                started, replied = time.time(), 0
+                self._publish(True, len(ips), 0, started)
                 for i in range(0, len(ips), settings.PING_BATCH):
                     if self._stop_event.is_set():
                         return
@@ -679,6 +709,7 @@ class PingSweepThread(threading.Thread):
                     batch = [ip for ip in ips[i:i + settings.PING_BATCH]
                              if any(ipaddress.IPv4Address(ip) in n for n in allowed)]
                     if len(batch) != len(ips[i:i + settings.PING_BATCH]):
+                        self._publish(False)
                         break
                     alive = self._ping_batch(batch)
                     now   = time.time()
@@ -688,9 +719,19 @@ class PingSweepThread(threading.Thread):
                                 if dev.ip == ip:
                                     dev.last_seen = now
                                     dev.status    = _device_status(dev)
+                    replied += len(alive)
+                    self._publish(True, len(ips), i + len(batch), now + delay)
                     self._stop_event.wait(delay)
+                else:
+                    # Only a sweep that reached every host counts as done; the
+                    # next one starts right away and publishes these.
+                    now = time.time()
+                    self._last_done_at  = now
+                    self._last_replied  = replied
+                    self._last_duration = now - started
             except Exception as e:
                 _note("PingSweepThread.run", e)
+                self._publish(False)
                 self._stop_event.wait(settings.PING_CYCLE)
 
     def stop(self):

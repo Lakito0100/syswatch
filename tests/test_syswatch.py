@@ -322,6 +322,15 @@ def _fake_system_snap(is_pi=False):
     }
 
 
+def _fake_scan_status(**over):
+    now = time.time()
+    status = {"active": True, "hosts_total": 254, "hosts_done": 120, "batch_size": 10,
+              "next_batch_at": now + 7.2, "cycle_s": 455.0,
+              "last_done_at": now - 600, "last_replied": 6}
+    status.update(over)
+    return status
+
+
 class RenderTests(unittest.TestCase):
     """Every tab, at several terminal sizes, with both well-formed and
     hostile state — a render must never raise or draw out of bounds."""
@@ -410,7 +419,8 @@ class RenderTests(unittest.TestCase):
         }
         pi = dict(good, system=_fake_system_snap(is_pi=True),
                   network_meta={"net_id": "gw:x", "trusted": True, "trustable": True,
-                                "cidrs": ["10.0.0.0/24"], "scan_mode": "trusted"})
+                                "cidrs": ["10.0.0.0/24"], "scan_mode": "trusted"},
+                  scan_status=_fake_scan_status())
         never = dict(good, network_meta={"net_id": "net:10.0.0.0/24", "trusted": False,
                                          "trustable": False, "cidrs": [], "scan_mode": "never"})
         half_hostile = dict(good, backup={"last_run": None}, services=[],
@@ -469,6 +479,40 @@ class RenderTests(unittest.TestCase):
         boot = next(ln for ln in lines if ln.startswith("/boot/firmware"))
         self.assertEqual(root.index("%"), boot.index("%"))
         self.assertEqual(root.index("["), boot.index("["))
+
+    def _network_screen(self, **over):
+        state = dict(self._states()[2], **over)  # the trusted ("pi") state
+        win = helpers.FakeWin(24, 120)
+        rnd.FullRenderer(win, self.tabs).render(2, state, "", "normal", "", 0, 0)
+        return win.text().splitlines()
+
+    def test_network_tab_shows_sweep_progress_while_scanning(self):
+        # It only said "ACTIVE SCANNING" — nothing about when or how often.
+        lines = self._network_screen()
+        sweep = next(ln for ln in lines if "SWEEP" in ln)
+        self.assertIn("SWEEP 120/254 hosts", sweep)
+        self.assertIn("next batch of 10 in 7s", sweep)
+        self.assertIn("full sweep ≈ every 8m", sweep)  # 455s, rounded
+        self.assertIn("(6 replied)", sweep)
+        self.assertEqual(lines.index(sweep), 4)            # right under the status line
+        self.assertTrue(lines[5].startswith("IP "))        # table moved down one row
+
+    def test_network_tab_sweep_line_states(self):
+        first = self._network_screen(scan_status=_fake_scan_status(
+            last_done_at=None, last_replied=None, next_batch_at=time.time() - 1))
+        line = next(ln for ln in first if "SWEEP" in ln)
+        self.assertIn("pinging now", line)
+        self.assertIn("first sweep in progress", line)
+        waiting = self._network_screen(scan_status=None)
+        self.assertTrue(any("SWEEP waiting to start" in ln for ln in waiting))
+
+    def test_network_tab_has_no_sweep_line_when_not_trusted(self):
+        win = helpers.FakeWin(24, 120)
+        rnd.FullRenderer(win, self.tabs).render(
+            2, dict(self._states()[0], scan_status=_fake_scan_status()), "", "normal", "", 0, 0)
+        lines = win.text().splitlines()
+        self.assertFalse(any("SWEEP" in ln for ln in lines))
+        self.assertTrue(lines[4].startswith("IP "))
 
     def test_history_cache_reloads_only_on_change(self):
         self._write_history()
