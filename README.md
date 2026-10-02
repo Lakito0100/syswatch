@@ -233,6 +233,8 @@ The status line at the top of the tab shows the scan state:
 - `SCANNING DISABLED (scan = never)`
 - `PASSIVE-ONLY — network can't be identified` (no gateway MAC)
 
+While a trusted network is being scanned, a second line shows when and how often the pings go out, for example `SWEEP 120/254 hosts · next batch of 10 in 7s · full sweep ≈ every 8m · last done 09:12 (6 replied)`: progress through the current sweep, the countdown to the next batch, how long a full sweep really takes (measured, so a little longer than `ping_cycle`), and when the last one finished and how many hosts answered. Right after `[s]` + `[y]` it reads `SWEEP waiting to start…` for a few seconds.
+
 The `[t]` hint sits next to it and turns red while an INTRUDER is flagged. Both are drawn inside the tab itself, not the footer, so they stay visible on narrow terminals and whatever footer alert is showing.
 
 When you switch networks, the device list is cleared, so `[t]` can never trust the previous network's devices onto the new one.

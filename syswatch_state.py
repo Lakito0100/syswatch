@@ -71,6 +71,10 @@ _state = {
     "storage":     None,
     "backup":      None,
     "network_meta": None,  # {"net_id", "known", "scan_mode"} — see ARPPassiveThread
+    # Active-sweep progress for the NETWORK tab — see PingSweepThread._publish.
+    # Always replaced with a new dict, never mutated in place, so the shallow
+    # copy get_state() takes is a consistent snapshot.
+    "scan_status": None,
 }
 _state_lock = threading.Lock()
 _alerts     = collections.deque(maxlen=5)

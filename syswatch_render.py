@@ -596,6 +596,42 @@ class FullRenderer:
                  "[s] scan"], cp(CP_WARN, bold=True))
 
     @staticmethod
+    def _scan_progress_variants(status, now):
+        """(variants longest-first, attr) for the line under the status line
+        while the network is trusted for scanning: the status line alone said
+        nothing about when or how often pings go out."""
+        if not status or not status.get("active"):
+            return (["SWEEP waiting to start…", "SWEEP waiting…", "waiting…"],
+                    cp(CP_MUTED))
+
+        def dur(secs):
+            secs = max(0, secs)
+            return f"{int(secs)}s" if secs < 120 else f"{round(secs / 60)}m"
+
+        progress = f"{status.get('hosts_done', 0)}/{status.get('hosts_total', 0)}"
+        left = (status.get("next_batch_at") or now) - now
+        if left < 1:
+            batch = short_next = "pinging now"
+            tiny = "now"
+        else:
+            batch = f"next batch of {status.get('batch_size', 0)} in {dur(left)}"
+            short_next = f"next in {dur(left)}"
+            tiny = dur(left)
+        cycle = dur(status.get("cycle_s") or 0)
+        done_at = status.get("last_done_at")
+        if done_at:
+            hhmm = _dt.fromtimestamp(done_at).strftime("%H:%M")
+            last_long = f"last done {hhmm} ({status.get('last_replied', 0)} replied)"
+            last_short = f"last {hhmm}"
+        else:
+            last_long = last_short = "first sweep in progress"
+        return ([f"SWEEP {progress} hosts · {batch} · full sweep ≈ every {cycle} · {last_long}",
+                 f"SWEEP {progress} · {short_next} · every ≈{cycle} · {last_short}",
+                 f"SWEEP {progress} · {short_next}",
+                 f"{progress} · {tiny}"],
+                cp(CP_SECONDARY))
+
+    @staticmethod
     def _device_status_variants(has_intruder):
         if has_intruder:
             return (["INTRUDER(S) FLAGGED — [t] trust all devices to clear (does not enable scanning)",
@@ -695,6 +731,14 @@ class FullRenderer:
         has_intruder = any(d.status == "INTRUDER" for d in devices.values())
         status_row = cy + 1
         self._render_network_status(status_row, W, net_meta, has_intruder)
+        hdr_row = status_row + 1
+        if (net_meta.get("trusted")
+                and net_meta.get("scan_mode", settings.SCAN_MODE) == "trusted"):
+            variants, attr = self._scan_progress_variants(state.get("scan_status"), time.time())
+            text = next((v for v in variants if len(v) <= W - 1), variants[-1][:max(0, W - 1)])
+            if text:
+                self._add(hdr_row, 0, text, attr)
+            hdr_row += 1
         if not devices:
             msg = "SCANNING…  (ARP TABLE EMPTY OR UNAVAILABLE)"
             self._add(cy + ch // 2, max(0, (W - len(msg)) // 2), msg, cp(CP_MUTED))
@@ -706,7 +750,6 @@ class FullRenderer:
         # absorbs any extra terminal width instead of leaving the rest of a wide
         # window blank after a fixed 20-column table.
         hn_w = max(20, W - (15 + 2 + 17 + 2 + 2 + 12 + 2 + 10))
-        hdr_row = status_row + 1
         self._add(hdr_row, 0,
                   f"{'IP':<15}  {'MAC':<17}  {'HOSTNAME':<{hn_w}}  {'LAST SEEN':<12}  STATUS",
                   cp(CP_PRIMARY, bold=True))

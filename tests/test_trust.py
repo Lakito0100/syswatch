@@ -200,6 +200,8 @@ class PingSweepGateTests(_TrustBase):
         for p in (p1, p2, p3, p4):
             p.start()
             self.addCleanup(p.stop)
+        st._state["scan_status"] = None
+        self.addCleanup(st._state.__setitem__, "scan_status", None)
 
     def sweep(self, seconds=0.6, scan_mode="trusted", network_fn=None):
         t = net.PingSweepThread(scan_mode=scan_mode, trust=self.trust,
@@ -250,6 +252,35 @@ class PingSweepGateTests(_TrustBase):
             self.sweep(network_fn=flaky)
         # Gate + first batch allowed, then the identity changed: at most one batch.
         self.assertLessEqual(len(self.pinged), 10)
+
+    def test_trusted_sweep_publishes_its_progress(self):
+        # The NETWORK tab had no way to show when or how often pings go out.
+        self.trust.trust(GW, [CIDR])
+        self.sweep()
+        s = st._state["scan_status"]
+        self.assertEqual(s["hosts_total"], 254)
+        self.assertEqual(s["batch_size"], 64)
+        self.assertGreater(s["hosts_done"], 0)
+        self.assertIsNotNone(s["last_done_at"])  # 0.6s covers several 0.2s sweeps
+        self.assertEqual(s["last_replied"], 0)    # FakeProc never answers
+        self.assertGreater(s["cycle_s"], 0)
+
+    def test_untrusted_network_publishes_no_active_sweep(self):
+        self.sweep()
+        s = st._state["scan_status"]
+        self.assertTrue(s is None or not s["active"])
+
+    def test_leaving_the_network_marks_the_sweep_inactive(self):
+        self.trust.trust(GW, [CIDR])
+        calls = {"n": 0}
+
+        def flaky():
+            calls["n"] += 1
+            return (GW, [CIDR]) if calls["n"] <= 2 else (OTHER_GW, [CIDR])
+
+        with mock.patch.object(st.settings, "PING_BATCH", 10):
+            self.sweep(network_fn=flaky)
+        self.assertFalse(st._state["scan_status"]["active"])
 
     def test_no_fallback_target_without_a_local_subnet(self):
         self.trust.trust(GW, [CIDR])
