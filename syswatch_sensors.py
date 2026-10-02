@@ -16,7 +16,7 @@ from datetime import datetime as _dt
 
 import psutil
 
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 
 # ── debug logging ─────────────────────────────────────────────────────────────
 # A shared, dependency-free error-tracking facility used by syswatch.py and
@@ -177,6 +177,59 @@ def chown_to_invoking_user(*paths):
             pass
 
 
+# ── alert logs (single writer) ───────────────────────────────────────────────
+#
+# The TUI and syswatch-logger both watch CPU temperature and disk usage and
+# used to both append to temp_alerts.log / disk_alerts.log — so with both
+# running (the normal setup) every alert was logged twice. Whichever process
+# first takes an exclusive flock on alerts.lock becomes the writer and keeps
+# the lock for its lifetime; the other skips the file write (it still rings
+# the bell / shows its footer alert). The kernel releases the lock when the
+# holder exits, so the other process takes over at its next alert.
+
+_alert_lock_fd   = None
+_alert_lock_mutex = threading.Lock()
+
+
+def _hold_alert_lock(directory):
+    global _alert_lock_fd
+    if _alert_lock_fd is not None:
+        return True
+    import fcntl
+    path = os.path.join(directory, "alerts.lock")
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        return False
+    _alert_lock_fd = fd
+    chown_to_invoking_user(path)
+    return True
+
+
+def append_alert(filename, msg, directory=None):
+    """Append a timestamped line to the alert log `filename` — in `directory`,
+    or the sudo-aware data dir by default — unless another syswatch process
+    is the alert writer. Returns True if this process wrote it. Never raises."""
+    try:
+        path = (os.path.join(directory, filename) if directory
+                else user_data_path(filename))
+        d = os.path.dirname(path)
+        os.makedirs(d, exist_ok=True)
+        with _alert_lock_mutex:
+            if not _hold_alert_lock(d):
+                return False
+            ts = _dt.now().strftime("%Y-%m-%d %H:%M:%S")
+            with open(path, "a") as f:
+                f.write(f"{ts} {msg}\n")
+        chown_to_invoking_user(d, path)
+        return True
+    except Exception as e:
+        note_error(f"append_alert ({filename})", e)
+        return False
+
+
 # ── platform identity ────────────────────────────────────────────────────────
 
 _is_pi_cache = None
@@ -198,14 +251,17 @@ def platform_model():
     except Exception:
         pass
     try:
-        for line in open("/proc/cpuinfo"):
-            if line.startswith("Model"):
-                return line.split(":", 1)[1].strip()
+        with open("/proc/cpuinfo") as f:
+            for line in f:
+                if line.startswith("Model"):
+                    return line.split(":", 1)[1].strip()
     except Exception:
         pass
     try:
-        vendor  = open("/sys/class/dmi/id/sys_vendor").read().strip()
-        product = open("/sys/class/dmi/id/product_name").read().strip()
+        with open("/sys/class/dmi/id/sys_vendor") as f:
+            vendor = f.read().strip()
+        with open("/sys/class/dmi/id/product_name") as f:
+            product = f.read().strip()
         model = " ".join(p for p in (vendor, product) if p)
         if model:
             return model
@@ -256,6 +312,12 @@ def cpu_temp():
     try:
         with open("/sys/class/thermal/thermal_zone0/temp") as f:
             return round(int(f.read().strip()) / 1000, 1)
+    except FileNotFoundError:
+        # No thermal zone at all (VMs, containers, many desktops without
+        # lm-sensors set up) — an absent sensor, not a broken one. Recording
+        # it as an error lit the header's degraded ⚠ permanently on exactly
+        # the machines where the TEMP row already explains what's missing.
+        pass
     except Exception as e:
         note_error("cpu_temp (thermal_zone0 fallback)", e)
     return None
@@ -379,9 +441,71 @@ def gpu_temp():
     return result
 
 
+def _read_gpu_temp_pi():
+    if not shutil.which("vcgencmd"):
+        return None
+    try:
+        r = subprocess.run(
+            ["vcgencmd", "measure_temp", "pmic"],
+            capture_output=True, text=True, timeout=0.5,
+        )
+    except Exception as e:
+        note_error("_read_gpu_temp_pi", e)
+        return None
+    raw = r.stdout.strip()
+    if r.returncode != 0 or "temp=" not in raw:
+        return None
+    try:
+        return float(raw.split("=")[1].strip("'C "))
+    except ValueError as e:
+        note_error("_read_gpu_temp_pi (parse)", e)
+        return None
+
+
+def gpu_temp_c():
+    """The GPU temperature the TUI shows, in °C, or None. Shared with the
+    logger: gpu_temp() only knows NVIDIA/AMD/Intel, so a logger that used it
+    left the gpu_temp column empty on every Pi while the TUI showed a value."""
+    if is_pi():
+        return _read_gpu_temp_pi()
+    gpu = gpu_temp()
+    return gpu["temp"] if gpu else None
+
+
 # ── storage device / temperature ─────────────────────────────────────────────
 
 _root_device_cache = None
+
+
+def _physical_disk(partition):
+    """Name of the whole physical disk (e.g. "nvme0n1", "sda") underneath
+    `partition`, or None if lsblk can't tell.
+
+    `lsblk -s` walks the dependency chain *downwards* from the given device,
+    so this resolves through any stack of device-mapper layers. Asking only
+    for the immediate parent (PKNAME) was wrong for the default Ubuntu/Debian
+    encrypted or LVM install: the parent of /dev/mapper/vg-root is the LUKS
+    container or the partition (e.g. "nvme0n1p3"), not the disk, so SMART was
+    queried on a partition and /sys/block/<base>/stat — which only exists for
+    whole disks — couldn't be read at all.
+    """
+    if not shutil.which("lsblk"):
+        return None
+    try:
+        r = subprocess.run(["lsblk", "-nrso", "NAME,TYPE", partition],
+                           capture_output=True, text=True, timeout=2)
+        if r.returncode == 0:
+            for line in r.stdout.splitlines():
+                fields = line.split()
+                if len(fields) >= 2 and fields[1] == "disk":
+                    return fields[0]
+        r = subprocess.run(["lsblk", "-no", "PKNAME", partition],
+                           capture_output=True, text=True, timeout=2)
+        if r.returncode == 0 and r.stdout.strip():
+            return r.stdout.strip().splitlines()[0].strip()
+    except Exception as e:
+        note_error("root_device (lsblk)", e)
+    return None
 
 
 def root_device():
@@ -409,13 +533,7 @@ def root_device():
     base = None
     if partition:
         dev_name = os.path.basename(partition)
-        try:
-            r = subprocess.run(["lsblk", "-no", "PKNAME", partition],
-                                capture_output=True, text=True, timeout=2)
-            if r.returncode == 0 and r.stdout.strip():
-                base = r.stdout.strip().splitlines()[0].strip()
-        except Exception as e:
-            note_error("root_device (lsblk)", e)
+        base = _physical_disk(partition)
         if not base:
             m = re.match(r"^(mmcblk\d+|nvme\d+n\d+|sd[a-z]+|vd[a-z]+|xvd[a-z]+)", dev_name)
             base = m.group(1) if m else dev_name

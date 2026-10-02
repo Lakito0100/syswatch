@@ -1,0 +1,35 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install dependencies
+        run: python -m pip install psutil ruff
+      - name: Lint
+        run: ruff check --select E9,F,B --target-version py39 syswatch*.py tests/*.py
+      - name: Unit and end-to-end tests
+        run: python -m unittest discover -v -s tests -t tests
+
+  installer:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y python3-psutil shellcheck
+      - name: shellcheck
+        run: shellcheck install-syswatch.sh
+      - name: Installer tests (need root)
+        run: sudo python3 -m unittest discover -v -s tests -t tests -p "test_installer.py"

@@ -10,17 +10,18 @@ from datetime import datetime as _dt
 
 
 def _bootstrap():
+    # psutil is the one third-party dependency. It used to be pip-installed
+    # here on first run — under `sudo` that meant pip writing into the system
+    # Python with --break-system-packages, which can break apt-managed
+    # packages. Now it's installed by install-syswatch.sh (apt's
+    # python3-psutil); if it's missing, say how to get it and stop.
     import importlib.util as ilu
-    missing = [p for p in ("psutil",) if ilu.find_spec(p) is None]
-    if missing:
-        print(f"Installing: {', '.join(missing)} …")
-        try:
-            subprocess.check_call(
-                [sys.executable, "-m", "pip", "install", "--quiet"] + missing)
-        except subprocess.CalledProcessError:
-            subprocess.check_call(
-                [sys.executable, "-m", "pip", "install", "--quiet",
-                 "--break-system-packages"] + missing)
+    if ilu.find_spec("psutil") is None:
+        sys.stderr.write(
+            "syswatch needs the psutil Python module, which isn't installed.\n"
+            "Install it with:  sudo apt install python3-psutil\n"
+            "(or re-run install-syswatch.sh, which does this for you).\n")
+        sys.exit(1)
 
 _bootstrap()
 import psutil
@@ -55,16 +56,9 @@ def _core_voltage():
 
 
 def _append_alert(log_dir, filename, msg):
-    try:
-        path = os.path.join(log_dir, filename)
-        ts = _dt.now().strftime("%Y-%m-%d %H:%M:%S")
-        with open(path, "a") as f:
-            f.write(f"{ts} {msg}\n")
-        # No-op unless running under sudo, where a newly created alert log
-        # would otherwise be root-owned inside the user's home.
-        sensors.chown_to_invoking_user(path)
-    except Exception as e:
-        sensors.note_error("_append_alert", e)
+    # append_alert makes sure only one of syswatch-logger / the TUI writes
+    # each alert, instead of both logging it.
+    sensors.append_alert(filename, msg, directory=log_dir)
 
 
 def _check_temp_alert(log_dir, temp, thresh_pair, prev_level):
@@ -93,6 +87,9 @@ def _check_disk_alert(log_dir, pct, thresh_pair, prev_level):
     return level
 
 
+_TRIM_INTERVAL = 3600.0  # seconds between retention trims
+
+
 def _trim(csv_path, days=30):
     try:
         cutoff = time.time() - days * 86400
@@ -110,8 +107,15 @@ def _trim(csv_path, days=30):
             except Exception:
                 pass
         if keep_from > 0:
-            with open(csv_path, "w") as f:
+            # Written to a temp file and renamed into place: rewriting
+            # metrics.csv in place left a window where the HISTORY tab (which
+            # reads it concurrently) saw a truncated or empty file, and a crash
+            # or power loss mid-write lost the whole history.
+            tmp = f"{csv_path}.tmp.{os.getpid()}"
+            with open(tmp, "w") as f:
                 f.writelines(lines[keep_from:])
+            os.replace(tmp, csv_path)
+            sensors.chown_to_invoking_user(csv_path)
     except Exception as e:
         sensors.note_error("_trim", e)
 
@@ -159,11 +163,19 @@ def main():
     # ownership only needs correcting for files it had to create.
     sensors.chown_to_invoking_user(log_dir, csv_path)
 
-    # Prime cpu_percent so the first non-blocking call has a valid baseline.
+    # Prime cpu_percent so the first non-blocking call has a valid baseline,
+    # and give it a moment to accumulate one: sampling immediately after
+    # priming measured a ~0s window, so every logger start wrote a junk
+    # (usually 0.0) CPU value into the history.
     psutil.cpu_percent(interval=None)
+    time.sleep(1.0)
 
     temp_alert_level = 0
     disk_alert_level = 0
+    # Trimming reads and rewrites the whole CSV; once per sample was wasteful
+    # with a short --interval (a month at 1s is millions of lines, re-read
+    # every second). Retention is in days, so trimming hourly is plenty.
+    last_trim = None
 
     while True:
         try:
@@ -172,7 +184,7 @@ def main():
             temp  = sensors.cpu_temp()
             disk  = psutil.disk_usage("/").percent
             volt  = _core_voltage()
-            gtemp = sensors.gpu_temp()
+            gtemp = sensors.gpu_temp_c()
             stemp = sensors.storage_temp()
             try:
                 batt = psutil.sensors_battery()
@@ -184,14 +196,17 @@ def main():
             # 4 decimals: core voltage moves in ~0.0125V steps, .1f would
             # collapse the whole series to one flat value.
             volt_str  = f"{volt:.4f}" if volt is not None else ""
-            gtemp_str = f"{gtemp['temp']:.1f}" if gtemp is not None else ""
+            gtemp_str = f"{gtemp:.1f}" if gtemp is not None else ""
             stemp_str = f"{stemp:.1f}" if stemp is not None else ""
             batt_str  = f"{batt.percent:.1f}" if batt is not None else ""
             line = (f"{ts},{cpu:.1f},{mem:.1f},{temp_str},{disk:.1f},"
                      f"{volt_str},{gtemp_str},{stemp_str},{batt_str}\n")
             with open(csv_path, "a") as f:
                 f.write(line)
-            _trim(csv_path, days=retention_days)
+            mono = time.monotonic()
+            if last_trim is None or mono - last_trim >= _TRIM_INTERVAL:
+                _trim(csv_path, days=retention_days)
+                last_trim = mono
             temp_alert_level = _check_temp_alert(log_dir, temp, thresh.get("cpu_temp"), temp_alert_level)
             disk_alert_level = _check_disk_alert(log_dir, disk, thresh.get("disk_pct"), disk_alert_level)
         except Exception as e:

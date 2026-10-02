@@ -4,9 +4,11 @@ After=network.target
 
 [Service]
 Type=simple
-# User= is rewritten to the installing user by install-syswatch.sh; the value
-# below is just the default fallback used when SUDO_USER is unset.
-User=lukas
+# User= is rewritten to the installing user by install-syswatch.sh (the user
+# behind sudo, or --user NAME). If installing this unit by hand, replace the
+# placeholder with the account whose ~/.local/share/syswatch should hold the
+# metrics — the unit deliberately fails to start until you do.
+User=CHANGE_ME
 ExecStart=/usr/bin/python3 /usr/local/lib/syswatch/syswatch-logger.py
 Restart=on-failure
 RestartSec=30
