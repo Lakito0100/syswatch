@@ -157,12 +157,50 @@ def _name_or_none(hostname, ip):
     return hostname if hostname and hostname != ip else None
 
 
+_RECENT_WINDOW = 300.0
+# Longest one batch's pings can add to a sweep on top of the inter-batch
+# delay: PingSweepThread._ping_batch() waits at most 2 s per process.
+_PING_BATCH_MAX_S = 2.0
+
+
+def _recent_window():
+    """Seconds since last_seen a device still counts as "Recent".
+
+    A quiet device that only shows up because it answers the sweep is seen
+    once per pass, and a pass takes PING_CYCLE plus the batches' own ping
+    time (~450 s for a /24 at the default 420 s). A fixed 300 s marked every
+    such device Idle for the last third of each pass — on the first pass,
+    devices found early went Idle before the sweep had even finished the
+    subnet. While sweeping, allow two passes, so one lost reply to the
+    single-packet ping doesn't make a live device Idle either.
+
+    The pass length is the larger of the measured cycle_s and an upper-bound
+    estimate: until the first sweep completes, cycle_s is just the nominal
+    PING_CYCLE, which is short by the ping time — and that first sweep is
+    exactly when this used to show.
+
+    Callers hold _state_lock (it isn't reentrant), so this reads _state
+    without taking it."""
+    scan = _state.get("scan_status")
+    if not scan or not scan.get("active"):
+        return _RECENT_WINDOW
+    batches  = -(-scan.get("hosts_total", 0) // max(1, scan.get("batch_size") or 1))
+    estimate = settings.PING_CYCLE + batches * _PING_BATCH_MAX_S
+    period   = max(scan.get("cycle_s") or 0, estimate)
+    return max(_RECENT_WINDOW, 2 * period)
+
+
 def _device_status(dev: DeviceInfo) -> str:
+    window = _recent_window()
     if dev.status == "INTRUDER":
-        return "Idle" if time.time() - dev.last_seen > settings.INTRUDER_TTL else "INTRUDER"
+        # Same reason as above: with INTRUDER_TTL barely longer than one pass,
+        # a single missed ping turned the flag into Idle — for good, since the
+        # status is overwritten and never re-derived as INTRUDER.
+        ttl = max(settings.INTRUDER_TTL, window)
+        return "Idle" if time.time() - dev.last_seen > ttl else "INTRUDER"
     age = time.time() - dev.last_seen
-    if age < 10:   return "Active"
-    if age < 300:  return "Recent"
+    if age < 10:      return "Active"
+    if age < window:  return "Recent"
     return "Idle"
 
 

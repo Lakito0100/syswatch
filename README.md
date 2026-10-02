@@ -209,6 +209,8 @@ Lists the devices on the local network — IP address, MAC address, resolved hos
 
 "Last seen" comes from the kernel's neighbour state (`ip -j neigh`). Only an entry the kernel has recently confirmed (REACHABLE/DELAY/PROBE) counts as seeing the device; a STALE entry doesn't. Linux keeps STALE entries indefinitely on small networks, so a switched-off device would otherwise stay "Active" for days. Without iproute2's JSON output, syswatch falls back to `/proc/net/arp`, which has no state, so presence in the table is all it can use.
 
+A device is Active if it was seen in the last 10 seconds and Recent for up to 5 minutes. After that it is Idle. While syswatch is sweeping the network (see `[s]` below), Recent lasts for two sweep passes instead, because a quiet device is only seen once per pass. With the default 7-minute `ping_cycle`, Idle therefore means the device missed two sweeps, not that one pass hadn't reached it yet.
+
 **Two separate keys, two separate kinds of trust:**
 
 - **`[t]` — trust all devices.** Every currently listed device is written into the [known-devices allowlist](#known-devices-allowlist) and any INTRUDER flags are cleared. That's all: it does **not** make syswatch scan the network. `syswatch --trust-all-devices` does the same without the TUI.
