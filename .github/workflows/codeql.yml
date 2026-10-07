@@ -1,0 +1,48 @@
+name: codeql
+
+# Static analysis for bugs: CodeQL traces data and control flow through the
+# code to find things a linter can't, such as None dereferences, unreachable
+# code, exceptions that get swallowed, command injection into the subprocess
+# calls, and unsafe file handling. Findings appear under Security → Code
+# scanning, and on pull requests as annotations on the changed lines.
+#
+# Style and unused-import checks stay in tests.yml (ruff).
+
+on:
+  push:
+    branches: [main, development]
+  pull_request:
+  schedule:
+    # Weekly, so alerts from new CodeQL queries show up even when the code
+    # hasn't changed.
+    - cron: "23 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    name: analyze (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write   # upload results to code scanning
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        # "actions" also checks the workflow files themselves, e.g. for
+        # untrusted input reaching a run: step.
+        language: [python, actions]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: github/codeql-action/init@v4
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: none
+          # The default suite plus the code-quality (likely-bug) queries.
+          queries: security-and-quality
+      - uses: github/codeql-action/analyze@v4
+        with:
+          category: "/language:${{ matrix.language }}"
