@@ -26,7 +26,7 @@ class InstallerTests(unittest.TestCase):
         self.tmp = tempfile.mkdtemp(prefix="swinst-")
         # The installer acts in the user's home as that user, so (like any
         # real home) it has to be reachable by them.
-        os.chmod(self.tmp, 0o755)
+        os.chmod(self.tmp, 0o711)
         self.addCleanup(shutil.rmtree, self.tmp, True)
         self.user = f"swtest{os.getpid() % 100000}"
         self.home = os.path.join(self.tmp, "home")
@@ -249,7 +249,7 @@ class InstallerTests(unittest.TestCase):
         stub = os.path.join(self.tmp, "stubbin", "python3")
         with open(stub, "w") as f:
             f.write("#!/bin/sh\nexit 1\n")  # fails the version check
-        os.chmod(stub, 0o755)
+        os.chmod(stub, 0o700)  # only root runs it
         code, out = self.run_unattended()
         self.assertNotEqual(code, 0)
         self.assertIn("needs Python 3.10 or newer", out)

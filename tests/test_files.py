@@ -10,7 +10,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from unittest import mock
+import unittest.mock
 
 import helpers  # noqa: F401  (puts the repo root on sys.path)
 import syswatch_files as files
@@ -20,7 +20,7 @@ class LocalWriteTests(unittest.TestCase):
     """The in-process path, also when the suite itself runs under sudo."""
 
     def setUp(self):
-        p = mock.patch.object(files, "_invoking_cache", (None,))
+        p = unittest.mock.patch.dict(files._invoking, {"user": None})
         p.start()
         self.addCleanup(p.stop)
         self.tmp = tempfile.mkdtemp()
@@ -87,9 +87,23 @@ class LocalWriteTests(unittest.TestCase):
         link = os.path.join(self.tmp, "alerts.lock")
         os.symlink(self.victim, link)
         with self.assertRaises(OSError):
-            files.open_lock(link)
-        fd = files.open_lock(os.path.join(self.tmp, "real.lock"))
-        os.close(fd)
+            os.close(files.open_lock(link))
+        os.close(files.open_lock(os.path.join(self.tmp, "real.lock")))
+
+    def test_new_files_are_private_and_existing_modes_kept(self):
+        for name, write in (("a.json", lambda p: files.write_atomic(p, b"{}")),
+                            ("b.toml", lambda p: files.write_atomic(p, b"x", exclusive=True)),
+                            ("c.log", lambda p: files.append(p, b"x\n"))):
+            path = os.path.join(self.tmp, name)
+            write(path)
+            self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o600, name)
+        lock = os.path.join(self.tmp, "alerts.lock")
+        os.close(files.open_lock(lock))
+        self.assertEqual(stat.S_IMODE(os.stat(lock).st_mode), 0o600)
+        log = os.path.join(self.tmp, "c.log")
+        os.chmod(log, 0o700)
+        files.append(log, b"y\n")
+        self.assertEqual(stat.S_IMODE(os.stat(log).st_mode), 0o700)
 
     def test_writes_as_the_user_need_nothing_readable_but_the_target(self):
         # The child gets its program inline; it never imports from disk.
@@ -97,9 +111,9 @@ class LocalWriteTests(unittest.TestCase):
         self.assertIn("def _write_local", files._child_program())
 
     def test_not_root_means_no_invoking_user(self):
-        with mock.patch.object(files, "_invoking_cache", ()), \
-             mock.patch.object(files.os, "geteuid", return_value=1000), \
-             mock.patch.dict(os.environ, {"SUDO_USER": "someone"}):
+        with unittest.mock.patch.dict(files._invoking, clear=True), \
+             unittest.mock.patch.object(files.os, "geteuid", return_value=1000), \
+             unittest.mock.patch.dict(os.environ, {"SUDO_USER": "someone"}):
             self.assertIsNone(files.invoking_user())
 
     def test_signature_changes_when_the_file_does(self):
@@ -119,7 +133,7 @@ class SudoWriteTests(unittest.TestCase):
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="swfiles-")
-        os.chmod(self.tmp, 0o755)
+        os.chmod(self.tmp, 0o711)  # the user must reach their home, not list this
         self.addCleanup(shutil.rmtree, self.tmp, True)
         self.user = f"swfiles{os.getpid() % 100000}"
         self.home = os.path.join(self.tmp, "home")

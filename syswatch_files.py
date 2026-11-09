@@ -17,6 +17,10 @@ without ever following a symlink at the file being written: temporary files
 come from mkstemp() (O_EXCL), and appends and exclusive creates use
 O_NOFOLLOW.
 
+New files are created 0600: they hold the LAN's device MACs and hostnames,
+the networks trusted for scanning and the alert history, which other local
+users have no business reading. A file that already exists keeps its mode.
+
 Standard library only: the logger, the installer's helpers and the child
 process all import this.
 """
@@ -40,26 +44,24 @@ _CHILD_TIMEOUT = 30  # seconds; a write is a few KB at most
 
 # ── who writes ───────────────────────────────────────────────────────────────
 
-_invoking_cache = ()  # () = not yet resolved; (value,) once resolved
+_invoking = {}  # {"user": passwd entry or None} once resolved
 
 
 def invoking_user():
     """passwd entry of the human behind `sudo`, or None when that doesn't
     apply (not root, no SUDO_USER, SUDO_USER is root, or unknown user).
     Cached: it can't change during the process."""
-    global _invoking_cache
-    if _invoking_cache:
-        return _invoking_cache[0]
-    pw = None
-    try:
-        if os.geteuid() == 0:
-            name = os.environ.get("SUDO_USER")
-            if name and name != "root":
-                pw = pwd.getpwnam(name)
-    except Exception:
+    if "user" not in _invoking:
         pw = None
-    _invoking_cache = (pw,)
-    return pw
+        try:
+            if os.geteuid() == 0:
+                name = os.environ.get("SUDO_USER")
+                if name and name != "root":
+                    pw = pwd.getpwnam(name)
+        except Exception:
+            pw = None
+        _invoking["user"] = pw
+    return _invoking["user"]
 
 
 def _inside(path, directory):
@@ -134,7 +136,7 @@ def open_lock(path):
         if d:
             os.makedirs(d, exist_ok=True)
         flags = os.O_RDONLY | os.O_CREAT
-    fd = os.open(path, flags | _O_NOFOLLOW | _O_NONBLOCK | _O_CLOEXEC, 0o644)
+    fd = os.open(path, flags | _O_NOFOLLOW | _O_NONBLOCK | _O_CLOEXEC, 0o600)
     try:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
             raise OSError(errno.EINVAL, "not a regular file", path)
@@ -156,25 +158,12 @@ def signature(path):
 
 # ── in-process writes ────────────────────────────────────────────────────────
 
-def _umask():
-    # Read rather than set-and-restore: os.umask() is process-wide, and
-    # briefly zeroing it would affect files other threads create meanwhile.
-    try:
-        with open("/proc/self/status") as f:
-            for line in f:
-                if line.startswith("Umask:"):
-                    return int(line.split()[1], 8)
-    except Exception:
-        pass
-    return 0o022
-
-
 def _write_local(path, data, exclusive):
     d = os.path.dirname(path) or "."
     os.makedirs(d, exist_ok=True)
     if exclusive:
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_NOFOLLOW | _O_CLOEXEC,
-                     0o666)
+                     0o600)
         with os.fdopen(fd, "wb") as f:
             f.write(data)
         return
@@ -183,19 +172,19 @@ def _write_local(path, data, exclusive):
         mode = stat.S_IMODE(st.st_mode) if stat.S_ISREG(st.st_mode) else None
     except FileNotFoundError:
         mode = None
-    if mode is None:
-        mode = 0o666 & ~_umask()
+    # mkstemp() creates it 0600, which is what a new file gets.
     fd, tmp = tempfile.mkstemp(dir=d, prefix="." + os.path.basename(path) + ".", suffix=".tmp")
     try:
         with os.fdopen(fd, "wb") as f:
             f.write(data)
-            os.fchmod(f.fileno(), mode)
+            if mode is not None:
+                os.fchmod(f.fileno(), mode)
         os.replace(tmp, path)
     except BaseException:
         try:
             os.unlink(tmp)
         except OSError:
-            pass
+            pass  # already gone: nothing left to clean up
         raise
 
 
@@ -205,7 +194,7 @@ def _append_local(path, data):
         os.makedirs(d, exist_ok=True)
     # O_NONBLOCK: opening a FIFO planted under this name must fail, not hang.
     fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | _O_NOFOLLOW
-                 | _O_NONBLOCK | _O_CLOEXEC, 0o666)
+                 | _O_NONBLOCK | _O_CLOEXEC, 0o600)
     try:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
             raise OSError(errno.EINVAL, "not a regular file", path)
