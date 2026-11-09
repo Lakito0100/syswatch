@@ -8,13 +8,13 @@ trusted for scanning."""
 import curses
 import ipaddress
 import json
-import os
 import shutil
 import socket
 import subprocess
 import threading
 import time
 
+import syswatch_files as files
 import syswatch_known_devices as known_devices
 import syswatch_sensors as sensors
 import syswatch_trusted_networks as trusted_networks
@@ -102,6 +102,9 @@ class ARPPassiveThread(threading.Thread):
     def __init__(self, trust=None):
         super().__init__(daemon=True)
         self._stop_event    = threading.Event()
+        # Signature first, then load: a write landing in between just means
+        # one harmless extra re-read later.
+        self._known_sig     = files.signature(settings.KNOWN_DEVICES_PATH)
         self._known         = known_devices.load(settings.KNOWN_DEVICES_PATH)
         self._trust         = trust if trust is not None else NetworkTrust()
         self._net_id        = None
@@ -250,15 +253,33 @@ class ARPPassiveThread(threading.Thread):
         with _state_lock:
             _state["network_meta"] = meta
 
+    def _sync_known_from_disk(self):
+        """Merge in whatever another process saved to known_devices.json
+        since this one last read or wrote it (`--trust-all-devices`, a second
+        syswatch). Before, this process kept its startup copy for good: its
+        next save silently dropped devices trusted elsewhere, and they stayed
+        flagged INTRUDER here. Cheap when nothing changed (one stat).
+        Callers hold self._known_lock."""
+        path = settings.KNOWN_DEVICES_PATH
+        sig = files.signature(path)
+        if sig is None or sig == self._known_sig:
+            return
+        self._known_sig = sig
+        self._known = known_devices.merge(self._known, known_devices.load(path))
+        net_id = self._net_id
+        with _state_lock:
+            for mac, dev in _state["devices"].items():
+                if dev.status == "INTRUDER" and known_devices.is_known(self._known, net_id, mac):
+                    dev.status = "Active"
+                    dev.status = _device_status(dev)
+
     def _save(self, now):
         # Callers hold self._known_lock (or own the instance outright, as the
         # one-shot CLI paths do).
+        self._sync_known_from_disk()  # don't overwrite another process's additions
         self._known = known_devices.prune(self._known, settings.KNOWN_DEVICES_RETENTION_DAYS, now)
         if known_devices.save(self._known, settings.KNOWN_DEVICES_PATH):
-            # Written under sudo it would otherwise be root-owned inside the
-            # user's home, which a later unprivileged run couldn't update.
-            sensors.chown_to_invoking_user(
-                os.path.dirname(settings.KNOWN_DEVICES_PATH), settings.KNOWN_DEVICES_PATH)
+            self._known_sig = files.signature(settings.KNOWN_DEVICES_PATH)
         else:
             # Genuine permanent breakage (unwritable path), not a transient
             # sensor hiccup — surface it rather than letting [t] look like it
@@ -314,6 +335,7 @@ class ARPPassiveThread(threading.Thread):
                 # Phase 3: re-acquire the lock to insert the new devices and
                 # refresh existing ones.
                 with self._known_lock:
+                    self._sync_known_from_disk()
                     with _state_lock:
                         devices = _state["devices"]
                         for mac, info in parsed.items():
@@ -413,21 +435,36 @@ class NetworkTrust:
     def __init__(self, path=None):
         self._path = path or settings.TRUSTED_NETWORKS_PATH
         self._lock = threading.Lock()
+        self._sig  = files.signature(self._path)
         self._data = trusted_networks.load(self._path)
+
+    def _refresh(self):
+        """Re-read the file if another process changed it. This used to be
+        read once at startup, so `syswatch --untrust-network` in a second
+        terminal printed "no longer scan it" while an already-running
+        syswatch kept sweeping until restarted — and its next save could put
+        the network back. Every check goes through here, so the sweep stops
+        within one batch. Callers hold self._lock."""
+        sig = files.signature(self._path)
+        if sig != self._sig:
+            self._sig = sig
+            self._data = trusted_networks.load(self._path)
 
     def is_trusted(self, net_id):
         with self._lock:
+            self._refresh()
             return trusted_networks.is_trusted(self._data, net_id)
 
     def cidrs(self, net_id):
         with self._lock:
+            self._refresh()
             return trusted_networks.trusted_cidrs(self._data, net_id)
 
     def _persist(self):
         if not trusted_networks.save(self._data, self._path):
             _note(f"trusted_networks.save (not persisted to {self._path})")
             return False
-        sensors.chown_to_invoking_user(os.path.dirname(self._path), self._path)
+        self._sig = files.signature(self._path)
         return True
 
     def trust(self, net_id, cidrs):
@@ -440,6 +477,7 @@ class NetworkTrust:
                     "(subnets larger than /22 are never swept)")
         gw = net_id[3:]
         with self._lock:
+            self._refresh()  # change the latest file, not a stale copy of it
             trusted_networks.trust(self._data, net_id, cidrs,
                                    label=f"{', '.join(cidrs)} via {gw}")
             if not self._persist():
@@ -449,6 +487,7 @@ class NetworkTrust:
 
     def untrust(self, net_id):
         with self._lock:
+            self._refresh()
             removed = trusted_networks.untrust(self._data, net_id)
             if removed:
                 self._persist()

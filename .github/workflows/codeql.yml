@@ -36,7 +36,7 @@ jobs:
         # untrusted input reaching a run: step.
         language: [python, actions]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: github/codeql-action/init@v4
         with:
           languages: ${{ matrix.language }}

@@ -4,10 +4,30 @@ fake curses window so renderers can be exercised without a terminal."""
 import importlib.util
 import os
 import sys
+import tempfile
+import uuid
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
+
+
+def scratch_dir(prefix):
+    """A new directory in the temp dir that other users can pass through but
+    not list (0711): for root-only tests that act as a throwaway user whose
+    home is inside it. Created with that mode in one step, under a fixed
+    umask, rather than chmod()ed afterwards."""
+    old = os.umask(0o022)
+    try:
+        while True:
+            path = os.path.join(tempfile.gettempdir(), prefix + uuid.uuid4().hex[:12])
+            try:
+                os.mkdir(path, 0o711)
+                return path
+            except FileExistsError:
+                continue
+    finally:
+        os.umask(old)
 
 
 def load_logger_module():

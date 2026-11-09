@@ -289,6 +289,83 @@ class PingSweepGateTests(_TrustBase):
         self.assertEqual(self.pinged, [])
 
 
+class OtherProcessTests(_TrustBase):
+    """A second syswatch, or the --trust-network / --untrust-network /
+    --trust-all-devices CLI, changes the files while this one runs."""
+
+    def test_untrust_elsewhere_stops_a_running_sweep(self):
+        self.trust.trust(GW, [CIDR])
+        sweeper = net.PingSweepThread(trust=self.trust, network_fn=self.net)
+        sweeper._binary_available = True
+        self.assertTrue(sweeper._allowed_networks())
+        # `syswatch --untrust-network` in another terminal: a separate instance.
+        self.assertTrue(net.NetworkTrust().untrust(GW))
+        self.assertEqual(sweeper._allowed_networks(), [])
+        self.assertFalse(self.trust.is_trusted(GW))
+
+    def test_trust_elsewhere_is_seen_and_saves_do_not_undo_each_other(self):
+        other = net.NetworkTrust()  # both loaded the empty file at startup
+        other.trust(GW, [CIDR])
+        self.assertTrue(self.trust.is_trusted(GW))
+        self.trust.trust(OTHER_GW, ["10.0.0.0/24"])
+        on_disk = tn.load(self.trust_path)
+        self.assertTrue(tn.is_trusted(on_disk, GW))
+        self.assertTrue(tn.is_trusted(on_disk, OTHER_GW))
+        # And an untrust in one isn't resurrected by the other's next save.
+        other.untrust(GW)
+        self.trust.untrust(OTHER_GW)
+        self.assertEqual(tn.load(self.trust_path), {})
+
+
+class KnownDevicesFromOtherProcessTests(_TrustBase):
+    def setUp(self):
+        super().setUp()
+        with st._state_lock:
+            st._state["devices"] = {}
+        self.addCleanup(lambda: st._state.__setitem__("devices", {}))
+        p = mock.patch.object(net, "current_network", side_effect=lambda: self.network)
+        p.start()
+        self.addCleanup(p.stop)
+        p = mock.patch.object(net, "_resolve_hostname", side_effect=lambda ip: ip)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_devices_trusted_elsewhere_clear_intruder_and_survive_our_save(self):
+        sw.known_devices.save({GW: {"known": {"first_seen": 1.0, "last_seen": time.time(),
+                                              "hostname": None}}},
+                              st.settings.KNOWN_DEVICES_PATH)
+        arp = net.ARPPassiveThread(trust=self.trust)
+        arp._refresh_network_identity(time.time())  # a network we know: no baseline
+        now = time.time()
+        with st._state_lock:
+            st._state["devices"]["stranger"] = st.DeviceInfo(
+                "192.168.178.9", "stranger", "x", now, now, "INTRUDER")
+        # `syswatch --trust-all-devices` in another terminal.
+        other = net.ARPPassiveThread(trust=self.trust)
+        sw.known_devices.remember(other._known, GW, "stranger", None, now)
+        other._save(now)
+        with arp._known_lock:
+            arp._sync_known_from_disk()
+        self.assertNotEqual(st.get_state()["devices"]["stranger"].status, "INTRUDER")
+        # This process saving its own change must keep the other's device.
+        with arp._known_lock:
+            sw.known_devices.remember(arp._known, GW, "mine", None, now)
+            arp._save(now)
+        saved = sw.known_devices.load(st.settings.KNOWN_DEVICES_PATH)[GW]
+        self.assertEqual(set(saved), {"known", "stranger", "mine"})
+
+    def test_merge_keeps_both_sides(self):
+        a = {GW: {"m": {"first_seen": 5.0, "last_seen": 10.0, "hostname": "old"}}}
+        b = {GW: {"m": {"first_seen": 3.0, "last_seen": 20.0, "hostname": None},
+                  "n": {"first_seen": 1.0, "last_seen": 2.0, "hostname": "n"}},
+             OTHER_GW: {"x": {"first_seen": 1.0, "last_seen": 1.0, "hostname": None}}}
+        merged = sw.known_devices.merge(a, b)
+        self.assertEqual(merged[GW]["m"], {"first_seen": 3.0, "last_seen": 20.0, "hostname": "old"})
+        self.assertIn("n", merged[GW])
+        self.assertIn("x", merged[OTHER_GW])
+        self.assertEqual(a[GW]["m"]["last_seen"], 10.0)  # inputs untouched
+
+
 class DeviceTrustNeverEnablesScanningTests(_TrustBase):
     def setUp(self):
         super().setUp()

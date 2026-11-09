@@ -9,10 +9,10 @@ syswatch detects the hardware it's running on and adapts: Raspberry Pi throttle 
 ## Requirements
 
 - Any Linux with systemd
-- Python 3.9 – 3.13
+- Python 3.10 – 3.15
 - [psutil](https://github.com/giampaolo/psutil) — `sudo apt install python3-psutil`. The installer does this for you. syswatch no longer pip-installs anything at runtime: if psutil is missing, it says how to install it and exits.
 
-[asciichartpy](https://github.com/kroitor/asciichart) (MIT), used for the HISTORY charts, is bundled as `syswatch_asciichart.py`, so there are no other third-party dependencies. Config parsing uses the standard library's `tomllib` on Python 3.11+, and a small built-in fallback parser on 3.9/3.10.
+[asciichartpy](https://github.com/kroitor/asciichart) (MIT), used for the HISTORY charts, is bundled as `syswatch_asciichart.py`, so there are no other third-party dependencies. Config parsing uses the standard library's `tomllib` on Python 3.11+, and a small built-in fallback parser on 3.10.
 
 Soft dependencies (each feature degrades gracefully — hiding the relevant row — if the tool isn't installed):
 - `lm-sensors` (`sensors-detect`) for CPU/motherboard temperature sensors on non-Pi hardware
@@ -33,6 +33,7 @@ The same command installs a fresh copy or upgrades an existing one.
 - All `syswatch*.py` modules go to `/usr/local/lib/syswatch/`, with a wrapper at `/usr/local/bin/syswatch`.
 - `syswatch-logger.service` is installed and started, running as you, so metrics collection begins immediately.
 - A fully commented example config goes to `/usr/share/doc/syswatch/config.example.toml`.
+- syswatch runs on the system's own `python3` (3.10 or newer), so nothing else needs installing. If there's no `python3` at all, the distribution's `python3` package is installed with apt; if it's older than 3.10, the installer stops and says so.
 - If `python3-psutil` is missing, it's installed with apt.
 
 **Upgrading an older version.** Any earlier syswatch is detected — its version is shown, or "older than 1.1" for versions that didn't record one — and its program files are removed completely before the new ones go in. That covers `/usr/local/lib/syswatch/`, the wrapper, the logger service and the doc directory, so no stale module or cache from an older layout survives. Two more checks run at the same time:
@@ -53,7 +54,7 @@ Then you choose to keep it (the default) or replace it. Replacing renames the ol
 - trusted-for-scanning networks
 - debug log
 
-Files there owned by another user (left by running an old version with `sudo`) are given back to you.
+Files there that root owns (left by running an old version with `sudo`) are given back to you. Everything else the installer does in your home — reading, writing, renaming and deleting these files — it does as you, never as root, so nothing in your home (a symlink, say) can redirect it elsewhere on the system.
 
 **Leftovers in root's home.** Older versions run with `sudo` kept their config and data in root's home instead of yours. If any are found, they're shown the same way, each with a keep (default) / delete question.
 
@@ -117,7 +118,7 @@ syswatch reads `$XDG_CONFIG_HOME/syswatch/config.toml` (default `~/.config/syswa
 | `~/.local/share/syswatch/temp_alerts.log`, `disk_alerts.log` | alert history |
 | `~/.local/share/syswatch/debug.log` | `--debug` output |
 
-So `sudo syswatch` reads your thresholds, your history and your device allowlist — rather than running on built-in defaults and flagging every device on your own LAN as an INTRUDER because root's allowlist is empty. Anything it has to *create* is written into the invoking user's home and chowned to them, so a `sudo` run never leaves behind root-owned state you can't update afterwards. An explicit `XDG_CONFIG_HOME` still wins for the config.
+So `sudo syswatch` reads your thresholds, your history and your device allowlist — rather than running on built-in defaults and flagging every device on your own LAN as an INTRUDER because root's allowlist is empty. Anything it writes there is written *as* the invoking user, by a short-lived helper process running as them, so a `sudo` run never leaves behind root-owned state you can't update afterwards — and root never writes into a directory you control, where a symlink could redirect the write. For the same reason, `sudo syswatch --write-default-config --config PATH` can only write where you could yourself. An explicit `XDG_CONFIG_HOME` still wins for the config.
 
 `sudo bash install-syswatch.sh` [generates this file interactively](#install) at install time, so it usually already exists. If you skipped that (`--skip-config`), deleted it, or are just editing it by hand, regenerate a starting point with:
 
@@ -397,9 +398,9 @@ The test suite uses only the standard library's `unittest` (plus `psutil`/`ascii
 python3 -m unittest discover -s tests -t tests
 ```
 
-`tests/test_installer.py` runs `install-syswatch.sh` end to end: install, upgrade over a fake old version, keep/replace/delete answers, and uninstall/purge. It needs root, because it creates a throwaway user, and is skipped otherwise. Run it with `sudo python3 -m unittest discover -s tests -t tests -p test_installer.py`. It installs into a scratch directory with a stub `systemctl`, so it doesn't touch the real system. GitHub Actions runs the whole suite on Python 3.9–3.13, plus the installer tests and `shellcheck`, on every push. CodeQL also scans the code for bugs and security issues on every push and pull request, and once a week; its findings are listed under the repository's Security → Code scanning tab.
+`tests/test_installer.py` runs `install-syswatch.sh` end to end: install, upgrade over a fake old version, keep/replace/delete answers, and uninstall/purge. It needs root, because it creates a throwaway user, and is skipped otherwise. Run it with `sudo python3 -m unittest discover -s tests -t tests -p test_installer.py`. It installs into a scratch directory with a stub `systemctl`, so it doesn't touch the real system. `tests/test_files.py` likewise has root-only tests that attack `sudo syswatch`'s writes with planted symlinks. GitHub Actions runs the whole suite on Python 3.10–3.15, plus the installer tests and `shellcheck`, on every push. CodeQL also scans the code for bugs and security issues on every push and pull request, and once a week; its findings are listed under the repository's Security → Code scanning tab.
 
-It covers config parsing/validation (both the `tomllib` and the Python 3.9/3.10 fallback parser), the scan-safety rules (`tests/test_trust.py`: `[t]` never enables scanning, only `[y]` confirms `[s]`, no ping ever leaves an untrusted, changed or unconfirmed network), the known-devices allowlist, sensor parsing (`smartctl`/`nvidia-smi` output, device-mapper root disks), syswatch-logger's trimming and alerts, the collector threads, rendering of every tab at several terminal sizes with both normal and malformed data, and end-to-end runs of `--report`, `--write-default-config`, `--trust-all-devices` and the TUI itself in a pseudo-terminal.
+It covers config parsing/validation (both the `tomllib` and the Python 3.10 fallback parser), the scan-safety rules (`tests/test_trust.py`: `[t]` never enables scanning, only `[y]` confirms `[s]`, no ping ever leaves an untrusted, changed or unconfirmed network), the known-devices allowlist, sensor parsing (`smartctl`/`nvidia-smi` output, device-mapper root disks), syswatch-logger's trimming and alerts, the collector threads, rendering of every tab at several terminal sizes with both normal and malformed data, and end-to-end runs of `--report`, `--write-default-config`, `--trust-all-devices` and the TUI itself in a pseudo-terminal.
 
 ---
 
