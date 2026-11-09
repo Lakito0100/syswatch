@@ -218,8 +218,20 @@ def _append_local(path, data):
 
 # ── writes as the invoking user ──────────────────────────────────────────────
 
-_CHILD_CODE = ("import sys; sys.path.insert(0, sys.argv[1]); "
-               "import syswatch_files; syswatch_files._child_main(sys.argv[2], sys.argv[3])")
+_child_source = None
+
+
+def _child_program():
+    """The child's program: this module's own source plus a call to
+    _child_main(), passed with `-c`. The child must not have to read
+    anything as the user but the file it writes — syswatch may be running
+    from a checkout they can't read (e.g. under /root), and importing this
+    module from there failed every write."""
+    global _child_source
+    if _child_source is None:
+        with open(os.path.splitext(os.path.abspath(__file__))[0] + ".py", encoding="utf-8") as f:
+            _child_source = f.read()
+    return _child_source + "\n_child_main(sys.argv[1], sys.argv[2])\n"
 
 
 def _run_as(pw, op, path, data):
@@ -232,8 +244,7 @@ def _run_as(pw, op, path, data):
         groups = [pw.pw_gid]
     r = subprocess.run(
         # -I: no PYTHON* variables, no user site-packages, no cwd on sys.path.
-        [sys.executable, "-I", "-c", _CHILD_CODE,
-         os.path.dirname(os.path.abspath(__file__)), op, os.path.abspath(path)],
+        [sys.executable, "-I", "-c", _child_program(), op, os.path.abspath(path)],
         input=data, capture_output=True, timeout=_CHILD_TIMEOUT, cwd="/",
         user=pw.pw_uid, group=pw.pw_gid, extra_groups=groups, umask=0o022,
         env={"PATH": "/usr/bin:/bin", "HOME": pw.pw_dir or "/", "LANG": "C.UTF-8"},

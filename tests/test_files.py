@@ -17,7 +17,12 @@ import syswatch_files as files
 
 
 class LocalWriteTests(unittest.TestCase):
+    """The in-process path, also when the suite itself runs under sudo."""
+
     def setUp(self):
+        p = mock.patch.object(files, "_invoking_cache", (None,))
+        p.start()
+        self.addCleanup(p.stop)
         self.tmp = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, self.tmp, True)
         self.victim = os.path.join(self.tmp, "victim")
@@ -86,6 +91,11 @@ class LocalWriteTests(unittest.TestCase):
         fd = files.open_lock(os.path.join(self.tmp, "real.lock"))
         os.close(fd)
 
+    def test_writes_as_the_user_need_nothing_readable_but_the_target(self):
+        # The child gets its program inline; it never imports from disk.
+        self.assertIn("_child_main(sys.argv[1], sys.argv[2])", files._child_program())
+        self.assertIn("def _write_local", files._child_program())
+
     def test_not_root_means_no_invoking_user(self):
         with mock.patch.object(files, "_invoking_cache", ()), \
              mock.patch.object(files.os, "geteuid", return_value=1000), \
@@ -130,16 +140,28 @@ class SudoWriteTests(unittest.TestCase):
         subprocess.run(["setpriv", f"--reuid={self.pw.pw_uid}", f"--regid={self.pw.pw_gid}",
                         "--init-groups", "--", *cmd], check=True)
 
+    def private_checkout(self):
+        """A copy of the code in a directory the user can't read — like a
+        checkout under /root (or CI's runner home), run with sudo."""
+        d = os.path.join(self.tmp, "private")
+        if not os.path.isdir(d):
+            os.makedirs(d, mode=0o700)
+            for name in os.listdir(helpers.ROOT):
+                if name.startswith("syswatch") and name.endswith(".py"):
+                    shutil.copy(os.path.join(helpers.ROOT, name), d)
+        return d
+
     def run_sudo_syswatch(self, *args):
         env = dict(os.environ, SUDO_USER=self.user, HOME=self.roothome)
         env.pop("XDG_CONFIG_HOME", None)
-        return subprocess.run([sys.executable, os.path.join(helpers.ROOT, "syswatch.py"), *args],
+        return subprocess.run([sys.executable, os.path.join(self.private_checkout(), "syswatch.py"), *args],
                               env=env, capture_output=True, text=True, timeout=60)
 
     def run_sudo_python(self, code, *args):
         env = dict(os.environ, SUDO_USER=self.user, HOME=self.roothome)
         return subprocess.run([sys.executable, "-c", "import sys; sys.path.insert(0, sys.argv[1]);" + code,
-                               helpers.ROOT, *args], env=env, capture_output=True, text=True, timeout=60)
+                               self.private_checkout(), *args],
+                              env=env, capture_output=True, text=True, timeout=60)
 
     def owner(self, path):
         return pwd.getpwuid(os.lstat(path).st_uid).pw_name
