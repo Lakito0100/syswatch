@@ -30,6 +30,7 @@ import threading
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import syswatch_sensors as sensors
 import syswatch_config
+import syswatch_files
 
 # Same safety net as syswatch.py: this is a long-running daemon with no
 # threads of its own today, but installing this is free and means a future
@@ -111,11 +112,7 @@ def _trim(csv_path, days=30):
             # metrics.csv in place left a window where the HISTORY tab (which
             # reads it concurrently) saw a truncated or empty file, and a crash
             # or power loss mid-write lost the whole history.
-            tmp = f"{csv_path}.tmp.{os.getpid()}"
-            with open(tmp, "w") as f:
-                f.writelines(lines[keep_from:])
-            os.replace(tmp, csv_path)
-            sensors.chown_to_invoking_user(csv_path)
+            syswatch_files.write_atomic(csv_path, "".join(lines[keep_from:]).encode())
     except Exception as e:
         sensors.note_error("_trim", e)
 
@@ -158,10 +155,7 @@ def main():
     # second metrics.csv under /root that the HISTORY tab never shows.
     csv_path = sensors.user_data_path("metrics.csv")
     log_dir  = os.path.dirname(csv_path)
-    os.makedirs(log_dir, exist_ok=True)
-    # Once at startup rather than per-sample: this is a long-running daemon and
-    # ownership only needs correcting for files it had to create.
-    sensors.chown_to_invoking_user(log_dir, csv_path)
+    syswatch_files.ensure_dir(log_dir)
 
     # Prime cpu_percent so the first non-blocking call has a valid baseline,
     # and give it a moment to accumulate one: sampling immediately after
@@ -201,8 +195,7 @@ def main():
             batt_str  = f"{batt.percent:.1f}" if batt is not None else ""
             line = (f"{ts},{cpu:.1f},{mem:.1f},{temp_str},{disk:.1f},"
                      f"{volt_str},{gtemp_str},{stemp_str},{batt_str}\n")
-            with open(csv_path, "a") as f:
-                f.write(line)
+            syswatch_files.append(csv_path, line.encode())
             mono = time.monotonic()
             if last_trim is None or mono - last_trim >= _TRIM_INTERVAL:
                 _trim(csv_path, days=retention_days)

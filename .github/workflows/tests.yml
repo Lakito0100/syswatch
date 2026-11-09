@@ -34,3 +34,5 @@ jobs:
         run: shellcheck install-syswatch.sh
       - name: Installer tests (need root)
         run: sudo python3 -m unittest discover -v -s tests -t tests -p "test_installer.py"
+      - name: sudo file-safety tests (need root)
+        run: sudo python3 -m unittest discover -v -s tests -t tests -p "test_files.py"

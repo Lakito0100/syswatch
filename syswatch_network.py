@@ -8,7 +8,6 @@ trusted for scanning."""
 import curses
 import ipaddress
 import json
-import os
 import shutil
 import socket
 import subprocess
@@ -254,12 +253,7 @@ class ARPPassiveThread(threading.Thread):
         # Callers hold self._known_lock (or own the instance outright, as the
         # one-shot CLI paths do).
         self._known = known_devices.prune(self._known, settings.KNOWN_DEVICES_RETENTION_DAYS, now)
-        if known_devices.save(self._known, settings.KNOWN_DEVICES_PATH):
-            # Written under sudo it would otherwise be root-owned inside the
-            # user's home, which a later unprivileged run couldn't update.
-            sensors.chown_to_invoking_user(
-                os.path.dirname(settings.KNOWN_DEVICES_PATH), settings.KNOWN_DEVICES_PATH)
-        else:
+        if not known_devices.save(self._known, settings.KNOWN_DEVICES_PATH):
             # Genuine permanent breakage (unwritable path), not a transient
             # sensor hiccup — surface it rather than letting [t] look like it
             # worked while nothing is ever remembered across runs.
@@ -427,7 +421,6 @@ class NetworkTrust:
         if not trusted_networks.save(self._data, self._path):
             _note(f"trusted_networks.save (not persisted to {self._path})")
             return False
-        sensors.chown_to_invoking_user(os.path.dirname(self._path), self._path)
         return True
 
     def trust(self, net_id, cidrs):

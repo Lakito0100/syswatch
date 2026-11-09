@@ -12,6 +12,8 @@ import json
 import os
 import time
 
+import syswatch_files as files
+
 DEFAULT_PATH = os.path.expanduser("~/.local/share/syswatch/known_devices.json")
 
 
@@ -71,13 +73,9 @@ def network_identity(local_networks=None):
 # ── persistence ────────────────────────────────────────────────────────────────
 
 def _atomic_write_json(path, data):
-    d = os.path.dirname(path)
-    if d:
-        os.makedirs(d, exist_ok=True)
-    tmp = f"{path}.tmp.{os.getpid()}"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
-    os.replace(tmp, path)
+    # Temp file + rename, done as the invoking user under sudo — see
+    # syswatch_files for why root never writes into their home itself.
+    files.write_atomic(path, json.dumps(data, indent=2).encode("utf-8"))
 
 
 def load(path=None):

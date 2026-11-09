@@ -15,6 +15,7 @@ import os
 import re
 import subprocess
 
+import syswatch_files as files
 import syswatch_sensors as sensors
 
 
@@ -617,17 +618,10 @@ def write_default_config(path=None, force=False, overrides=None):
     example_config_text()) baked in where given. Raises FileExistsError if
     the file already exists and force is False. Returns the path written."""
     path = path or config_path_default()
-    if os.path.exists(path) and not force:
-        raise FileExistsError(path)
-    d = os.path.dirname(path)
-    if d:
-        os.makedirs(d, exist_ok=True)
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.write(example_config_text(overrides))
-    os.replace(tmp, path)
-    # config_path_default() resolves to the invoking user's home under sudo, so
-    # without this `sudo syswatch --write-default-config` would leave a
-    # root-owned config they can't edit unprivileged.
-    sensors.chown_to_invoking_user(d, path)
+    # Under sudo this is written *as the invoking user* (see syswatch_files):
+    # config_path_default() points into their home, which root must not
+    # write into itself, and the file ends up theirs to edit. exclusive=True
+    # also refuses a dangling symlink planted where the file would go.
+    files.write_atomic(path, example_config_text(overrides).encode("utf-8"),
+                       exclusive=not force)
     return path
