@@ -16,6 +16,8 @@ from datetime import datetime as _dt
 
 import psutil
 
+import syswatch_files as files
+
 VERSION = "1.4.0"
 
 # ── debug logging ─────────────────────────────────────────────────────────────
@@ -66,18 +68,11 @@ def note_error(collector, exc=None):
             return
         _last_logged[collector] = now
     try:
-        path = debug_log_path()
-        d = os.path.dirname(path)
-        if d:
-            os.makedirs(d, exist_ok=True)
-        with open(path, "a") as f:
-            ts = _dt.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-            f.write(f"[{ts}] {collector}\n")
-            if exc is not None:
-                f.write("".join(
-                    traceback.format_exception(type(exc), exc, exc.__traceback__)))
-            f.write("\n")
-        chown_to_invoking_user(d, path)
+        ts = _dt.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+        text = f"[{ts}] {collector}\n"
+        if exc is not None:
+            text += "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+        files.append(debug_log_path(), (text + "\n").encode("utf-8", "replace"))
     except Exception:
         pass  # debug logging itself must never be a new source of crashes
 
@@ -99,9 +94,6 @@ def log_uncaught_thread_exception(args):
 
 # ── invoking user (sudo-aware paths) ─────────────────────────────────────────
 
-_invoking_home_cache = ()  # () = not yet resolved; (value,) once resolved
-
-
 def invoking_user_home():
     """Home directory of the human behind `sudo`, or None when that doesn't
     apply (not root, no SUDO_USER, or the user can't be resolved).
@@ -112,25 +104,11 @@ def invoking_user_home():
     unprivileged run uses. Everything that resolves per-user state goes through
     this so they all agree on whose files they mean; resolved via the passwd
     database rather than assuming /home/<name>, which is wrong for users with a
-    non-standard home.
-
-    Cached: the answer can't change during the process, and note_error() calls
-    into this often enough that repeating a passwd lookup would be wasteful.
+    non-standard home. (Writes there go through syswatch_files, which performs
+    them as that user.)
     """
-    global _invoking_home_cache
-    if _invoking_home_cache:
-        return _invoking_home_cache[0]
-    result = None
-    try:
-        if os.geteuid() == 0:
-            sudo_user = os.environ.get("SUDO_USER")
-            if sudo_user and sudo_user != "root":
-                import pwd
-                result = pwd.getpwnam(sudo_user).pw_dir or None
-    except Exception:
-        result = None
-    _invoking_home_cache = (result,)
-    return result
+    pw = files.invoking_user()
+    return (pw.pw_dir or None) if pw is not None else None
 
 
 def user_data_path(*parts):
@@ -139,8 +117,8 @@ def user_data_path(*parts):
     Prefers this process's own path when that file already exists, then the
     invoking user's. When neither exists the invoking user's wins, so state
     *created* during a `sudo` run lands in the real user's home rather than
-    root's — matching config_path_default(). Callers that write should follow
-    up with chown_to_invoking_user() so the result isn't root-owned.
+    root's — matching config_path_default(). Write through syswatch_files,
+    which does it as the invoking user, so the result is theirs.
     """
     own = os.path.join(os.path.expanduser("~/.local/share/syswatch"), *parts)
     if os.path.exists(own):
@@ -149,32 +127,6 @@ def user_data_path(*parts):
     if home:
         return os.path.join(home, ".local", "share", "syswatch", *parts)
     return own
-
-
-def chown_to_invoking_user(*paths):
-    """Under `sudo`, hand files/directories written into the invoking user's
-    home back to them, so a sudo run doesn't leave root-owned state the user
-    can no longer update unprivileged. Paths outside that home are left alone.
-    Best-effort throughout: failing to chown never invalidates the write."""
-    home = invoking_user_home()
-    if not home:
-        return
-    try:
-        import pwd
-        pw = pwd.getpwnam(os.environ["SUDO_USER"])
-        root = os.path.realpath(home)
-    except Exception:
-        return
-    for p in paths:
-        if not p:
-            continue
-        try:
-            real = os.path.realpath(p)
-            if real != root and not real.startswith(root + os.sep):
-                continue
-            os.chown(p, pw.pw_uid, pw.pw_gid)
-        except Exception:
-            pass
 
 
 # ── alert logs (single writer) ───────────────────────────────────────────────
@@ -196,15 +148,13 @@ def _hold_alert_lock(directory):
     if _alert_lock_fd is not None:
         return True
     import fcntl
-    path = os.path.join(directory, "alerts.lock")
-    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+    fd = files.open_lock(os.path.join(directory, "alerts.lock"))
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
         os.close(fd)
         return False
     _alert_lock_fd = fd
-    chown_to_invoking_user(path)
     return True
 
 
@@ -216,14 +166,12 @@ def append_alert(filename, msg, directory=None):
         path = (os.path.join(directory, filename) if directory
                 else user_data_path(filename))
         d = os.path.dirname(path)
-        os.makedirs(d, exist_ok=True)
+        files.ensure_dir(d)
         with _alert_lock_mutex:
             if not _hold_alert_lock(d):
                 return False
             ts = _dt.now().strftime("%Y-%m-%d %H:%M:%S")
-            with open(path, "a") as f:
-                f.write(f"{ts} {msg}\n")
-        chown_to_invoking_user(d, path)
+            files.append(path, f"{ts} {msg}\n".encode("utf-8", "replace"))
         return True
     except Exception as e:
         note_error(f"append_alert ({filename})", e)

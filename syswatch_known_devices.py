@@ -12,6 +12,8 @@ import json
 import os
 import time
 
+import syswatch_files as files
+
 DEFAULT_PATH = os.path.expanduser("~/.local/share/syswatch/known_devices.json")
 
 
@@ -71,13 +73,9 @@ def network_identity(local_networks=None):
 # ── persistence ────────────────────────────────────────────────────────────────
 
 def _atomic_write_json(path, data):
-    d = os.path.dirname(path)
-    if d:
-        os.makedirs(d, exist_ok=True)
-    tmp = f"{path}.tmp.{os.getpid()}"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
-    os.replace(tmp, path)
+    # Temp file + rename, done as the invoking user under sudo — see
+    # syswatch_files for why root never writes into their home itself.
+    files.write_atomic(path, json.dumps(data, indent=2).encode("utf-8"))
 
 
 def load(path=None):
@@ -134,6 +132,33 @@ def prune(data, retention_days=90, now=None):
         if kept:
             pruned[net_id] = kept
     return pruned
+
+
+def merge(mine, theirs):
+    """Union of two allowlists — this process's copy and one another process
+    (`--trust-all-devices`, a second syswatch) saved meanwhile — so neither
+    side's devices are lost when one of them saves. Per device: the earliest
+    first_seen, the latest last_seen, and the hostname from whichever saw it
+    last (falling back to the other's)."""
+    out = {net_id: {mac: dict(info) for mac, info in devices.items()}
+           for net_id, devices in mine.items()}
+    for net_id, devices in theirs.items():
+        net = out.setdefault(net_id, {})
+        for mac, info in devices.items():
+            ours = net.get(mac)
+            if ours is None:
+                net[mac] = dict(info)
+                continue
+            firsts = [t for t in (ours.get("first_seen"), info.get("first_seen")) if t is not None]
+            lasts  = [t for t in (ours.get("last_seen"), info.get("last_seen")) if t is not None]
+            newer, older = ((info, ours) if (info.get("last_seen") or 0) > (ours.get("last_seen") or 0)
+                            else (ours, info))
+            net[mac] = {
+                "first_seen": min(firsts) if firsts else None,
+                "last_seen":  max(lasts) if lasts else None,
+                "hostname":   newer.get("hostname") or older.get("hostname"),
+            }
+    return out
 
 
 # ── queries / mutation ────────────────────────────────────────────────────────

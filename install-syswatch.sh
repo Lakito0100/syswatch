@@ -2,6 +2,11 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Work from / from here on. `python3 -c` and `python3 -` put the current
+# directory first on sys.path, so starting the installer from a directory
+# other users can write to (e.g. `cd /tmp && sudo bash syswatch/install-
+# syswatch.sh`) let a planted json.py or shlex.py run as root.
+cd /
 
 # Install locations. The SYSWATCH_* overrides exist only so the test suite can
 # install into a scratch directory — leave them unset for a real install.
@@ -11,6 +16,7 @@ UNIT_DIR="${SYSWATCH_UNIT_DIR:-/etc/systemd/system}"
 DOC_DIR="${SYSWATCH_DOC_DIR:-/usr/share/doc/syswatch}"
 ROOT_HOME="${SYSWATCH_ROOT_HOME:-$(getent passwd root | cut -d: -f6 || true)}"
 ROOT_HOME="${ROOT_HOME:-/root}"
+PYTHON="python3"   # absolute path once ensure_python3 has run
 # Where find_stray_launchers looks besides the target user's ~/.local/bin and
 # ~/bin. Overridable so the tests don't see the real install's launcher.
 if [[ -v SYSWATCH_LAUNCHER_DIRS ]]; then
@@ -25,6 +31,7 @@ SKIP_CONFIG=0
 PURGE=0
 TARGET_USER=""
 INTERACTIVE=0   # set in dispatch: 1 only with a terminal and no --unattended
+STAGE_DIR=""    # see make_stage
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -34,8 +41,25 @@ check_root() {
     [[ "$EUID" -eq 0 ]] || die "This script must be run as root (use sudo)."
 }
 
-check_python3() {
-    command -v python3 >/dev/null 2>&1 || die "python3 is not available. Please install Python 3."
+# syswatch runs on the system's own python3, whatever version the
+# distribution ships, so no second Python has to be installed alongside it.
+# Only if there's none at all is the distribution's python3 package
+# installed (the newest Python it supports, and the one its python3-psutil
+# package is built for). PYTHON is that interpreter's absolute path; the
+# launcher and the logger service both run on exactly it.
+MIN_PYTHON="3.10"
+
+ensure_python3() {
+    if ! command -v python3 >/dev/null 2>&1; then
+        command -v apt-get >/dev/null 2>&1 \
+            || die "python3 is not installed. Install your distribution's python3 package and re-run."
+        echo "Installing python3 (apt)..."
+        apt-get install -y python3 >/dev/null \
+            || die "Could not install python3 — run 'sudo apt install python3' and re-run."
+    fi
+    PYTHON="$(command -v python3)"
+    "$PYTHON" -c "import sys; sys.exit(sys.version_info < tuple(map(int, '$MIN_PYTHON'.split('.'))))" \
+        || die "syswatch needs Python $MIN_PYTHON or newer, and this system's python3 ($PYTHON) is $("$PYTHON" -c 'import platform; print(platform.python_version())' 2>/dev/null || echo "older")."
 }
 
 # Resolves the user syswatch is installed for — --user NAME if given,
@@ -58,7 +82,8 @@ resolve_install_target() {
     # explicit check below gets a chance to report it properly.
     INSTALL_HOME="$(getent passwd "$INSTALL_USER" | cut -d: -f6)" || true
     [[ -n "$INSTALL_HOME" ]] || die "Could not resolve a home directory for user '$INSTALL_USER'."
-    INSTALL_GROUP="$(id -gn "$INSTALL_USER" 2>/dev/null || echo "$INSTALL_USER")"
+    INSTALL_UID="$(id -u "$INSTALL_USER")"
+    INSTALL_GID="$(id -g "$INSTALL_USER")"
     CONFIG_PATH="$INSTALL_HOME/.config/syswatch/config.toml"
     DATA_DIR="$INSTALL_HOME/.local/share/syswatch"
 }
@@ -85,10 +110,74 @@ ask_yes_no() {
     done
 }
 
-# Summaries of existing config/data files come from syswatch_inventory.py in
-# the source tree being installed, so the shell never parses TOML/CSV/JSON.
+# ── acting in a user's home ──────────────────────────────────────────────────
+#
+# Everything under a user's home is theirs to control: they can swap any
+# directory there for a symlink at any moment. Root reading, writing, moving,
+# deleting or chowning by path in there can be steered anywhere on the
+# system — a ~/.config -> /usr/local/lib symlink made the config step
+# `chown -R` the installed program to the user, who could then edit code
+# that `sudo syswatch` runs as root. So every file operation in the target
+# user's home runs *as that user* (as_owner), and can only do what they
+# could do anyway. The one step that needs root — handing back files an old
+# `sudo syswatch` left root-owned — is syswatch_files.give_back(), which
+# never follows a symlink.
+
+# as_owner WHO CMD... — run CMD as WHO, which is "root" (run directly) or
+# $INSTALL_USER.
+as_owner() {
+    local who="$1"
+    shift
+    if [[ "$who" == "root" ]]; then
+        "$@"
+        return
+    fi
+    [[ "$who" == "$INSTALL_USER" ]] || die "internal error: as_owner '$who'"
+    if command -v setpriv >/dev/null 2>&1; then
+        setpriv --reuid="$INSTALL_UID" --regid="$INSTALL_GID" --init-groups -- \
+            env HOME="$INSTALL_HOME" USER="$INSTALL_USER" LOGNAME="$INSTALL_USER" "$@"
+    else
+        runuser -u "$INSTALL_USER" -- \
+            env HOME="$INSTALL_HOME" USER="$INSTALL_USER" LOGNAME="$INSTALL_USER" "$@"
+    fi
+}
+
+check_privilege_tools() {
+    [[ "$INSTALL_USER" == "root" ]] && return 0
+    command -v setpriv >/dev/null 2>&1 || command -v runuser >/dev/null 2>&1 \
+        || die "setpriv or runuser (util-linux) is needed to act as $INSTALL_USER."
+}
+
+# A root-owned, world-readable copy of the modules being installed, which
+# every Python helper runs from: the target user can read it even when the
+# source tree can't be (e.g. a checkout in /root), and only root can change it.
+make_stage() {
+    STAGE_DIR="$(mktemp -d -t syswatch-install.XXXXXX)"
+    chmod 755 "$STAGE_DIR"
+    install -m 644 "$SCRIPT_DIR"/syswatch*.py "$STAGE_DIR"/
+}
+
+cleanup_stage() {
+    if [[ -n "$STAGE_DIR" ]]; then
+        rm -rf -- "$STAGE_DIR"
+    fi
+}
+trap cleanup_stage EXIT
+
+# py WHO ARGS... — python3 as WHO, importing the staged modules. No bytecode
+# caches: nothing should be written next to them.
+py() {
+    local who="$1"
+    shift
+    as_owner "$who" env PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$STAGE_DIR" "$PYTHON" "$@"
+}
+
+# Summaries of existing config/data files come from syswatch_inventory.py, so
+# the shell never parses TOML/CSV/JSON. inventory WHO ARGS... reads as WHO.
 inventory() {
-    run_py "$SCRIPT_DIR/syswatch_inventory.py" "$@"
+    local who="$1"
+    shift
+    py "$who" "$STAGE_DIR/syswatch_inventory.py" "$@"
 }
 
 version_in() {
@@ -100,12 +189,12 @@ version_in() {
 }
 
 safe_rm_dir() {
-    # rm -rf, but only on a path that is plainly one of syswatch's own
-    # directories — never an empty or unexpected value.
-    local dir="$1"
+    # rm -rf, as WHO (default root), but only on a path that is plainly one
+    # of syswatch's own directories — never an empty or unexpected value.
+    local dir="$1" who="${2:-root}"
     [[ -n "$dir" && "$dir" != "/" && "$(basename "$dir")" == "syswatch" ]] \
         || die "refusing to remove unexpected directory '$dir'"
-    rm -rf -- "$dir"
+    as_owner "$who" rm -rf -- "$dir"
 }
 
 # ── existing program files ───────────────────────────────────────────────────
@@ -187,7 +276,7 @@ find_stray_launchers() {
 # Only reported: something else on the system might use it.
 report_pip_leftovers() {
     local origin
-    origin="$(python3 -c 'import importlib.util as u; s = u.find_spec("asciichartpy"); print(s.origin if s else "")' 2>/dev/null || true)"
+    origin="$("$PYTHON" -c 'import importlib.util as u; s = u.find_spec("asciichartpy"); print(s.origin if s else "")' 2>/dev/null || true)"
     if [[ -n "$origin" ]]; then
         echo "  Note: asciichartpy is installed at $(dirname "$origin") (pip-installed by older"
         echo "        syswatch versions). syswatch bundles it now, so it isn't needed any more;"
@@ -196,7 +285,7 @@ report_pip_leftovers() {
 }
 
 ensure_psutil() {
-    if python3 -c 'import psutil' 2>/dev/null; then
+    if "$PYTHON" -c 'import psutil' 2>/dev/null; then
         return
     fi
     if command -v apt-get >/dev/null 2>&1; then
@@ -210,49 +299,50 @@ ensure_psutil() {
 
 # ── existing config and data ─────────────────────────────────────────────────
 
-# review_data_dir DIR TITLE — one-line summary of every file in DIR and a
-# keep (default) / delete question each.
+# review_data_dir DIR TITLE SKIP WHO — one-line summary of every file in DIR
+# and a keep (default) / delete question each. Reads and deletes as WHO (the
+# owner of the home DIR is in, or root for root's home).
 review_data_dir() {
-    local dir="$1" title="$2" skip="${3:-}" files=() f
-    [[ -d "$dir" ]] || return 0
+    local dir="$1" title="$2" skip="$3" who="$4" files=() f
+    as_owner "$who" test -d "$dir" || return 0
     while IFS= read -r f; do
         [[ -n "$skip" && "$(basename -- "$f")" == "$skip" ]] || files+=("$f")
-    done < <(inventory files "$dir")
+    done < <(inventory "$who" files "$dir")
     (( ${#files[@]} )) || return 0
     echo "  $title ($dir):"
     for f in "${files[@]}"; do
-        echo "    - $(inventory file "$f")"
+        echo "    - $(inventory "$who" file "$f")"
         if ! ask_yes_no "Keep it?" y; then
-            rm -f -- "$f"
+            as_owner "$who" rm -f -- "$f"
             echo "      Deleted."
         fi
     done
-    rmdir --ignore-fail-on-non-empty "$dir" 2>/dev/null || true
+    as_owner "$who" rmdir --ignore-fail-on-non-empty "$dir" 2>/dev/null || true
 }
 
-# review_config_dir DIR — config.toml, then every other file in DIR: the
+# review_config_dir DIR WHO — config.toml, then every other file in DIR: the
 # config.toml.bak-* copies a "replace" saves were otherwise never offered for
 # deletion, so they outlived an uninstall unless --purge was used.
 review_config_dir() {
-    local dir="$1"
-    if [[ -f "$dir/config.toml" ]]; then
-        review_config_for_removal "$dir/config.toml" || true
+    local dir="$1" who="$2"
+    if as_owner "$who" test -f "$dir/config.toml"; then
+        review_config_for_removal "$dir/config.toml" "$who" || true
     fi
-    review_data_dir "$dir" "Other config files" config.toml
+    review_data_dir "$dir" "Other config files" config.toml "$who"
 }
 
-# review_config_for_removal PATH — summary + keep (default) / delete.
+# review_config_for_removal PATH WHO — summary + keep (default) / delete.
 # Returns 0 if the file is still there afterwards.
 review_config_for_removal() {
-    local path="$1"
-    [[ -f "$path" ]] || return 1
+    local path="$1" who="$2"
+    as_owner "$who" test -f "$path" || return 1
     echo "  Config:"
-    inventory config "$path" | sed 's/^/    /'
+    inventory "$who" config "$path" | sed 's/^/    /'
     if ask_yes_no "Keep it?" y; then
         return 0
     fi
-    rm -f -- "$path"
-    rmdir --ignore-fail-on-non-empty "$(dirname "$path")" 2>/dev/null || true
+    as_owner "$who" rm -f -- "$path"
+    as_owner "$who" rmdir --ignore-fail-on-non-empty "$(dirname "$path")" 2>/dev/null || true
     echo "      Deleted."
     return 1
 }
@@ -263,16 +353,16 @@ handle_config() {
         CONFIG_STATUS="not written (--skip-config) — run 'syswatch --write-default-config' any time"
         return
     fi
-    if [[ -f "$CONFIG_PATH" ]]; then
+    if as_owner "$INSTALL_USER" test -f "$CONFIG_PATH"; then
         echo "  Existing config found:"
-        inventory config "$CONFIG_PATH" | sed 's/^/    /'
+        inventory "$INSTALL_USER" config "$CONFIG_PATH" | sed 's/^/    /'
         if ask_yes_no "Keep this config? (no = save it as a backup and set up a new one)" y; then
             CONFIG_STATUS="kept existing $CONFIG_PATH"
             return
         fi
         local backup
         backup="$CONFIG_PATH.bak-$(date +%Y%m%d-%H%M%S)"
-        mv -- "$CONFIG_PATH" "$backup"
+        as_owner "$INSTALL_USER" mv -- "$CONFIG_PATH" "$backup"
         echo "      Saved the old config as $backup"
         if generate_config; then
             CONFIG_STATUS="new config written to $CONFIG_PATH (old one saved as $backup)"
@@ -300,21 +390,26 @@ review_root_leftovers() {
     echo ""
     echo "  Found syswatch files in root's home — most likely left by running an older"
     echo "  version with sudo. syswatch $NEW_VERSION uses $INSTALL_USER's files even under sudo."
-    review_config_dir "$cfg_dir"
-    review_data_dir "$data" "Data"
+    review_config_dir "$cfg_dir" root
+    review_data_dir "$data" "Data" "" root
 }
 
-# Files in the user's syswatch directories owned by someone else (root, from
-# an older version run with sudo) can't be updated by syswatch afterwards.
+# Files in the user's syswatch directories that root owns (left by an older
+# version run with sudo) can't be updated by syswatch — or reviewed and
+# deleted by the as-the-user steps — so they're given back first. Done by
+# syswatch_files.give_back(), which never follows a symlink and skips
+# hard-linked files: a plain `chown -R` here followed a user-made symlink
+# such as ~/.config -> /usr/local/lib and gave them the installed program.
 fix_ownership() {
     [[ "$INSTALL_USER" == "root" ]] && return 0
-    local d wrong
-    for d in "$INSTALL_HOME/.config/syswatch" "$DATA_DIR"; do
-        [[ -d "$d" ]] || continue
-        wrong="$(find "$d" ! -user "$INSTALL_USER" -print 2>/dev/null | wc -l)"
-        if (( wrong > 0 )); then
-            chown -R "$INSTALL_USER:$INSTALL_GROUP" "$d"
-            echo "  Gave $wrong file(s) in $d back to $INSTALL_USER (were owned by another user)."
+    local rel n
+    for rel in .config/syswatch .local/share/syswatch; do
+        n="$(py root -c '
+import sys, syswatch_files
+print(syswatch_files.give_back(sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4])))
+' "$INSTALL_HOME" "$rel" "$INSTALL_UID" "$INSTALL_GID")" || n=0
+        if [[ "$n" =~ ^[0-9]+$ ]] && (( n > 0 )); then
+            echo "  Gave $n root-owned file(s)/folder(s) in $INSTALL_HOME/$rel back to $INSTALL_USER."
         fi
     done
 }
@@ -327,16 +422,9 @@ fix_ownership() {
 # is validated via its validate_raw(), and the file itself is rendered via
 # its write_default_config(), never assembled as text in this script.
 
-# Runs Python against the source tree being installed (not whatever is in
-# $LIB_DIR, which may be an old version or already removed). No bytecode
-# caches: this runs as root inside the user's checkout.
-run_py() {
-    PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$SCRIPT_DIR" python3 "$@"
-}
-
 # validate_value SECTION KEY RAW — prints "OK <json-value>" or "ERR <msg>".
 validate_value() {
-    run_py - "$1" "$2" "$3" <<'PYEOF'
+    py root - "$1" "$2" "$3" <<'PYEOF'
 import sys, json
 import syswatch_config as cfg
 section, key, raw = sys.argv[1], sys.argv[2], sys.argv[3]
@@ -353,7 +441,7 @@ PYEOF
 # number that could drift out of sync with the Python source of truth.
 load_config_defaults() {
     local out
-    out="$(run_py - <<'PYEOF'
+    out="$(py root - <<'PYEOF'
 import shlex
 import syswatch_config as cfg
 
@@ -514,8 +602,8 @@ JSON
 )
 }
 
-# Writes $CONFIG_PATH (interactively or with pure defaults) and fixes
-# ownership. Assumes the caller already confirmed the file doesn't exist yet.
+# Writes $CONFIG_PATH (interactively or with pure defaults). Assumes the
+# caller already confirmed the file doesn't exist yet.
 generate_config() {
     local interactive="$INTERACTIVE"
 
@@ -524,13 +612,10 @@ generate_config() {
         prompt_for_config
     fi
 
-    local config_dir xdg_dir need_xdg_chown=0
-    config_dir="$(dirname "$CONFIG_PATH")"
-    xdg_dir="$(dirname "$config_dir")"
-    [[ -d "$xdg_dir" ]] || need_xdg_chown=1
-
+    # Written as $INSTALL_USER (see as_owner), so it and any directories it
+    # needs are theirs without a chown.
     local render_err
-    if ! render_err="$(run_py -c '
+    if ! render_err="$(py "$INSTALL_USER" -c '
 import sys, json
 import syswatch_config as cfg
 overrides = json.load(sys.stdin)
@@ -540,9 +625,6 @@ print(cfg.write_default_config(path=sys.argv[1], overrides=overrides))
         echo "  $render_err" >&2
         return 1
     fi
-
-    chown -R "$INSTALL_USER:$INSTALL_GROUP" "$config_dir"
-    [[ "$need_xdg_chown" == "1" ]] && chown "$INSTALL_USER:$INSTALL_GROUP" "$xdg_dir"
 
     echo "  Wrote $CONFIG_PATH (owned by $INSTALL_USER)"
 }
@@ -563,7 +645,7 @@ install_program_files() {
     echo "  Installed $(find "$LIB_DIR" -maxdepth 1 -name '*.py' | wc -l) files to $LIB_DIR"
 
     install -d -m 755 "$(dirname "$BIN_FILE")"
-    printf '#!/bin/bash\nexec python3 %q "$@"\n' "$LIB_DIR/syswatch.py" > "$BIN_FILE"
+    printf '#!/bin/bash\nexec %q %q "$@"\n' "$PYTHON" "$LIB_DIR/syswatch.py" > "$BIN_FILE"
     chmod 755 "$BIN_FILE"
     echo "  Installed $BIN_FILE"
 
@@ -572,19 +654,15 @@ install_program_files() {
         install -d -m 755 "$UNIT_DIR"
         install -m 644 "$service_src" "$SERVICE_DST"
         # The repo unit ships with a placeholder User=; run the logger as the
-        # user installing it, from wherever the files actually went.
+        # user installing it, from wherever the files actually went, on the
+        # same python3 as the launcher.
         sed -i -e "s|^User=.*|User=${INSTALL_USER}|" \
+               -e "s|^ExecStart=/usr/bin/python3 |ExecStart=${PYTHON} |" \
                -e "s|/usr/local/lib/syswatch/|${LIB_DIR}/|" "$SERVICE_DST"
         echo "  Installed $SERVICE_DST (User=${INSTALL_USER})"
         systemctl daemon-reload
         systemctl enable syswatch-logger.service
-        # restart (not start) so an updated syswatch-logger.py takes effect on reinstall
-        systemctl restart syswatch-logger.service
-        if systemctl is-active --quiet syswatch-logger.service; then
-            echo "  syswatch-logger service is running."
-        else
-            echo "  WARNING: syswatch-logger did not start — check: journalctl -u syswatch-logger"
-        fi
+        # Started by start_logger(), once the config is in place.
     fi
 
     # A commented example config, for reference only — the user's real
@@ -592,7 +670,7 @@ install_program_files() {
     install -d -m 755 "$DOC_DIR"
     local example_tmp
     example_tmp="$(mktemp)"
-    if run_py -c "import syswatch_config, sys; sys.stdout.write(syswatch_config.example_config_text())" \
+    if py root -c "import syswatch_config, sys; sys.stdout.write(syswatch_config.example_config_text())" \
         > "$example_tmp" 2>/dev/null; then
         install -m 644 "$example_tmp" "$DOC_DIR/config.example.toml"
         echo "  Installed $DOC_DIR/config.example.toml"
@@ -602,10 +680,28 @@ install_program_files() {
     rm -f "$example_tmp"
 }
 
+# Only now, after config.toml is written: the logger reads its config once at
+# startup, so starting it during install_program_files() ran it on the
+# built-in defaults (fresh install) or on the config that was just replaced
+# (upgrade) until the next reboot — e.g. trimming history to the old
+# retention.
+start_logger() {
+    [[ -f "$SERVICE_DST" ]] || return 0
+    # restart (not start) so an updated syswatch-logger.py takes effect on reinstall
+    systemctl restart syswatch-logger.service
+    if systemctl is-active --quiet syswatch-logger.service; then
+        echo "  syswatch-logger service is running."
+    else
+        echo "  WARNING: syswatch-logger did not start — check: journalctl -u syswatch-logger"
+    fi
+}
+
 do_install() {
     check_root
-    check_python3
+    ensure_python3
     resolve_install_target
+    check_privilege_tools
+    make_stage
     NEW_VERSION="$(version_in "$SCRIPT_DIR")"
     [[ -n "$NEW_VERSION" ]] || die "Could not read the version of the syswatch in $SCRIPT_DIR"
 
@@ -626,10 +722,14 @@ do_install() {
     echo ""
     echo "Config and data for $INSTALL_USER..."
     CONFIG_STATUS=""
-    handle_config
-    review_data_dir "$DATA_DIR" "Existing data files"
-    review_root_leftovers
     fix_ownership
+    handle_config
+    review_data_dir "$DATA_DIR" "Existing data files" "" "$INSTALL_USER"
+    review_root_leftovers
+
+    echo ""
+    echo "Starting the logger..."
+    start_logger
 
     echo ""
     echo "Verifying install..."
@@ -646,49 +746,69 @@ do_install() {
 
 # ── uninstall ─────────────────────────────────────────────────────────────────
 
+# purge_user_files HOME WHO — delete both syswatch directories, as WHO.
 purge_user_files() {
-    local home="$1" d
+    local home="$1" who="$2" d
     for d in "$home/.config/syswatch" "$home/.local/share/syswatch"; do
-        if [[ -d "$d" ]]; then
-            safe_rm_dir "$d"
-            echo "    Deleted $d"
+        if as_owner "$who" test -d "$d"; then
+            if safe_rm_dir "$d" "$who"; then
+                echo "    Deleted $d"
+            else
+                echo "    WARNING: could not delete everything in $d"
+            fi
         fi
     done
 }
 
+# review_user_files HOME TITLE WHO
 review_user_files() {
-    local home="$1" title="$2"
+    local home="$1" title="$2" who="$3"
     local cfg_dir="$home/.config/syswatch"
-    [[ -d "$cfg_dir" || -d "$home/.local/share/syswatch" ]] || return 0
+    as_owner "$who" test -d "$cfg_dir" || as_owner "$who" test -d "$home/.local/share/syswatch" \
+        || return 0
     echo ""
     echo "$title"
-    review_config_dir "$cfg_dir"
-    review_data_dir "$home/.local/share/syswatch" "Data"
+    review_config_dir "$cfg_dir" "$who"
+    review_data_dir "$home/.local/share/syswatch" "Data" "" "$who"
 }
 
 do_uninstall() {
     check_root
     resolve_install_target soft
+    if [[ -n "${INSTALL_USER:-}" ]]; then
+        check_privilege_tools
+    fi
+    make_stage
     echo "Uninstalling syswatch..."
     remove_program_files
     echo "  Program files removed."
 
-    local homes=()
-    [[ -n "${INSTALL_HOME:-}" ]] && homes+=("$INSTALL_HOME")
+    # Each home is reviewed/deleted as its owner (see as_owner).
+    local homes=() whos=()
+    if [[ -n "${INSTALL_HOME:-}" ]]; then
+        homes+=("$INSTALL_HOME")
+        whos+=("$INSTALL_USER")
+    fi
     if [[ -z "${INSTALL_HOME:-}" || "$(realpath -m "$ROOT_HOME")" != "$(realpath -m "${INSTALL_HOME:-}")" ]]; then
         homes+=("$ROOT_HOME")
+        whos+=(root)
+    fi
+    if [[ -n "${INSTALL_HOME:-}" && ( "$PURGE" == "1" || "$INTERACTIVE" == "1" ) ]]; then
+        # Root-owned leftovers inside the user's directories would otherwise
+        # be beyond what deleting as the user can remove.
+        fix_ownership
     fi
 
-    local home
+    local i
     if [[ "$PURGE" == "1" ]]; then
         echo ""
         echo "Deleting config and data (--purge)..."
-        for home in "${homes[@]}"; do
-            purge_user_files "$home"
+        for i in "${!homes[@]}"; do
+            purge_user_files "${homes[$i]}" "${whos[$i]}"
         done
     elif [[ "$INTERACTIVE" == "1" ]]; then
-        for home in "${homes[@]}"; do
-            review_user_files "$home" "Config and data in $home:"
+        for i in "${!homes[@]}"; do
+            review_user_files "${homes[$i]}" "Config and data in ${homes[$i]}:" "${whos[$i]}"
         done
     else
         echo "  Config and data were kept (~/.config/syswatch, ~/.local/share/syswatch);"

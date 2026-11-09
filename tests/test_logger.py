@@ -65,7 +65,6 @@ class SampleRowTests(unittest.TestCase):
         s = logger.sensors
         with mock.patch.object(s, "user_data_path",
                                side_effect=lambda *p: os.path.join(self.tmp.name, *p)), \
-             mock.patch.object(s, "chown_to_invoking_user"), \
              mock.patch.object(s, "is_pi", return_value=True), \
              mock.patch.object(s, "gpu_temp", return_value=None), \
              mock.patch.object(s, "cpu_temp", return_value=55.0), \
