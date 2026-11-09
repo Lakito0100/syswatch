@@ -9,10 +9,10 @@ syswatch detects the hardware it's running on and adapts: Raspberry Pi throttle 
 ## Requirements
 
 - Any Linux with systemd
-- Python 3.9 – 3.13
+- Python 3.10 – 3.15
 - [psutil](https://github.com/giampaolo/psutil) — `sudo apt install python3-psutil`. The installer does this for you. syswatch no longer pip-installs anything at runtime: if psutil is missing, it says how to install it and exits.
 
-[asciichartpy](https://github.com/kroitor/asciichart) (MIT), used for the HISTORY charts, is bundled as `syswatch_asciichart.py`, so there are no other third-party dependencies. Config parsing uses the standard library's `tomllib` on Python 3.11+, and a small built-in fallback parser on 3.9/3.10.
+[asciichartpy](https://github.com/kroitor/asciichart) (MIT), used for the HISTORY charts, is bundled as `syswatch_asciichart.py`, so there are no other third-party dependencies. Config parsing uses the standard library's `tomllib` on Python 3.11+, and a small built-in fallback parser on 3.10.
 
 Soft dependencies (each feature degrades gracefully — hiding the relevant row — if the tool isn't installed):
 - `lm-sensors` (`sensors-detect`) for CPU/motherboard temperature sensors on non-Pi hardware
@@ -397,9 +397,9 @@ The test suite uses only the standard library's `unittest` (plus `psutil`/`ascii
 python3 -m unittest discover -s tests -t tests
 ```
 
-`tests/test_installer.py` runs `install-syswatch.sh` end to end: install, upgrade over a fake old version, keep/replace/delete answers, and uninstall/purge. It needs root, because it creates a throwaway user, and is skipped otherwise. Run it with `sudo python3 -m unittest discover -s tests -t tests -p test_installer.py`. It installs into a scratch directory with a stub `systemctl`, so it doesn't touch the real system. GitHub Actions runs the whole suite on Python 3.9–3.13, plus the installer tests and `shellcheck`, on every push. CodeQL also scans the code for bugs and security issues on every push and pull request, and once a week; its findings are listed under the repository's Security → Code scanning tab.
+`tests/test_installer.py` runs `install-syswatch.sh` end to end: install, upgrade over a fake old version, keep/replace/delete answers, and uninstall/purge. It needs root, because it creates a throwaway user, and is skipped otherwise. Run it with `sudo python3 -m unittest discover -s tests -t tests -p test_installer.py`. It installs into a scratch directory with a stub `systemctl`, so it doesn't touch the real system. GitHub Actions runs the whole suite on Python 3.10–3.15, plus the installer tests and `shellcheck`, on every push. CodeQL also scans the code for bugs and security issues on every push and pull request, and once a week; its findings are listed under the repository's Security → Code scanning tab.
 
-It covers config parsing/validation (both the `tomllib` and the Python 3.9/3.10 fallback parser), the scan-safety rules (`tests/test_trust.py`: `[t]` never enables scanning, only `[y]` confirms `[s]`, no ping ever leaves an untrusted, changed or unconfirmed network), the known-devices allowlist, sensor parsing (`smartctl`/`nvidia-smi` output, device-mapper root disks), syswatch-logger's trimming and alerts, the collector threads, rendering of every tab at several terminal sizes with both normal and malformed data, and end-to-end runs of `--report`, `--write-default-config`, `--trust-all-devices` and the TUI itself in a pseudo-terminal.
+It covers config parsing/validation (both the `tomllib` and the Python 3.10 fallback parser), the scan-safety rules (`tests/test_trust.py`: `[t]` never enables scanning, only `[y]` confirms `[s]`, no ping ever leaves an untrusted, changed or unconfirmed network), the known-devices allowlist, sensor parsing (`smartctl`/`nvidia-smi` output, device-mapper root disks), syswatch-logger's trimming and alerts, the collector threads, rendering of every tab at several terminal sizes with both normal and malformed data, and end-to-end runs of `--report`, `--write-default-config`, `--trust-all-devices` and the TUI itself in a pseudo-terminal.
 
 ---
 
