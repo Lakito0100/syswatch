@@ -132,8 +132,7 @@ class SudoWriteTests(unittest.TestCase):
     way the user could attack it."""
 
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix="swfiles-")
-        os.chmod(self.tmp, 0o711)  # the user must reach their home, not list this
+        self.tmp = helpers.scratch_dir("swfiles-")  # the user must reach their home in it
         self.addCleanup(shutil.rmtree, self.tmp, True)
         self.user = f"swfiles{os.getpid() % 100000}"
         self.home = os.path.join(self.tmp, "home")

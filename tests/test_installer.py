@@ -9,7 +9,6 @@ import re
 import select
 import shutil
 import subprocess
-import tempfile
 import time
 import unittest
 
@@ -23,10 +22,9 @@ PROMPT = re.compile(rb"(\[Y/n\] |\[y/N\] |\]: )$")
                      "installer tests need root")
 class InstallerTests(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix="swinst-")
         # The installer acts in the user's home as that user, so (like any
         # real home) it has to be reachable by them.
-        os.chmod(self.tmp, 0o711)
+        self.tmp = helpers.scratch_dir("swinst-")
         self.addCleanup(shutil.rmtree, self.tmp, True)
         self.user = f"swtest{os.getpid() % 100000}"
         self.home = os.path.join(self.tmp, "home")
