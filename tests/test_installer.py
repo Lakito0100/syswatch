@@ -24,6 +24,9 @@ PROMPT = re.compile(rb"(\[Y/n\] |\[y/N\] |\]: )$")
 class InstallerTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="swinst-")
+        # The installer acts in the user's home as that user, so (like any
+        # real home) it has to be reachable by them.
+        os.chmod(self.tmp, 0o755)
         self.addCleanup(shutil.rmtree, self.tmp, True)
         self.user = f"swtest{os.getpid() % 100000}"
         self.home = os.path.join(self.tmp, "home")
@@ -55,10 +58,17 @@ class InstallerTests(unittest.TestCase):
         self.data = os.path.join(self.home, ".local", "share", "syswatch")
 
     # ── helpers ──────────────────────────────────────────────────────────────
-    def run_unattended(self, *args):
+    def run_unattended(self, *args, cwd=None):
         r = subprocess.run(["bash", INSTALLER, "--user", self.user, *args], env=self.env,
-                           stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=120)
+                           stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=120,
+                           cwd=cwd)
         return r.returncode, r.stdout + r.stderr
+
+    def as_user(self, *cmd):
+        import pwd
+        pw = pwd.getpwnam(self.user)
+        subprocess.run(["setpriv", f"--reuid={pw.pw_uid}", f"--regid={pw.pw_gid}",
+                        "--init-groups", "--", *cmd], check=True)
 
     def run_interactive(self, args, answers):
         """Answer each prompt in order; any prompt beyond `answers` gets Enter."""
@@ -223,6 +233,57 @@ class InstallerTests(unittest.TestCase):
         code, out = self.run_interactive(["--uninstall"], ["n"])
         self.assertEqual(code, 0, out)
         self.assertFalse(os.path.exists(os.path.dirname(self.config)))
+
+    # ── attacks by the user being installed for ──────────────────────────────
+    def assert_program_still_roots(self):
+        for p in (self.lib, os.path.join(self.lib, "syswatch.py"),
+                  os.path.join(self.lib, "syswatch_sensors.py")):
+            self.assertEqual(self.owner(p), "root", p)
+
+    def test_symlinked_config_dir_cannot_take_the_program(self):
+        # ~/.config -> the directory holding the program: the old installer
+        # wrote config.toml there and chowned the whole program to the user.
+        self.as_user("ln", "-s", os.path.dirname(self.lib), os.path.join(self.home, ".config"))
+        code, out = self.run_unattended()
+        self.assertEqual(code, 0, out)
+        self.assert_program_still_roots()
+        self.assertFalse(os.path.exists(os.path.join(self.lib, "config.toml")))
+
+    def test_symlinked_data_dir_cannot_take_the_program(self):
+        self.as_user("mkdir", "-p", os.path.join(self.home, ".local"))
+        self.as_user("ln", "-s", os.path.dirname(self.lib),
+                     os.path.join(self.home, ".local", "share"))
+        code, out = self.run_unattended()
+        self.assertEqual(code, 0, out)
+        self.assert_program_still_roots()
+        code, out = self.run_unattended("--uninstall", "--purge")
+        self.assertEqual(code, 0, out)
+
+    def test_planted_module_in_the_working_directory_is_not_imported(self):
+        cwd = os.path.join(self.tmp, "cwd")
+        os.makedirs(cwd)
+        marker = os.path.join(self.tmp, "PWNED")
+        for mod in ("json", "shlex", "ipaddress"):
+            with open(os.path.join(cwd, mod + ".py"), "w") as f:
+                f.write(f"open({marker!r}, 'w').close()\n")
+        code, out = self.run_unattended(cwd=cwd)
+        self.assertEqual(code, 0, out)
+        self.assertFalse(os.path.exists(marker))
+
+    def test_logger_starts_after_the_config_is_written(self):
+        # It reads config.toml once at startup; started before the config
+        # step it ran on defaults (or the replaced config) until a reboot.
+        log = os.path.join(self.tmp, "systemctl.log")
+        with open(os.path.join(self.tmp, "stubbin", "systemctl"), "w") as f:
+            f.write("#!/bin/sh\n"
+                    "[ \"$1\" = show ] && echo LoadState=not-found\n"
+                    f"if [ \"$1\" = restart ]; then if [ -f {self.config!r} ]; then "
+                    f"echo with-config >> {log!r}; else echo without-config >> {log!r}; fi; fi\n"
+                    "exit 0\n")
+        code, out = self.run_unattended()
+        self.assertEqual(code, 0, out)
+        with open(log) as f:
+            self.assertEqual(f.read().split(), ["with-config"])
 
     def test_purge_without_uninstall_is_rejected(self):
         code, out = self.run_unattended("--purge")

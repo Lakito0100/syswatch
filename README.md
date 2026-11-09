@@ -53,7 +53,7 @@ Then you choose to keep it (the default) or replace it. Replacing renames the ol
 - trusted-for-scanning networks
 - debug log
 
-Files there owned by another user (left by running an old version with `sudo`) are given back to you.
+Files there that root owns (left by running an old version with `sudo`) are given back to you. Everything else the installer does in your home — reading, writing, renaming and deleting these files — it does as you, never as root, so nothing in your home (a symlink, say) can redirect it elsewhere on the system.
 
 **Leftovers in root's home.** Older versions run with `sudo` kept their config and data in root's home instead of yours. If any are found, they're shown the same way, each with a keep (default) / delete question.
 
