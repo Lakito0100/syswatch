@@ -234,6 +234,27 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(code, 0, out)
         self.assertFalse(os.path.exists(os.path.dirname(self.config)))
 
+    def test_launcher_and_logger_use_the_same_system_python(self):
+        code, out = self.run_unattended()
+        self.assertEqual(code, 0, out)
+        with open(self.bin) as f:
+            launcher = f.read().split("\n")[1].split()[1]   # exec <python> <script>
+        with open(os.path.join(self.units, "syswatch-logger.service")) as f:
+            unit = [ln for ln in f.read().splitlines() if ln.startswith("ExecStart=")][0]
+        self.assertTrue(os.path.isabs(launcher), launcher)
+        self.assertEqual(unit.split("=", 1)[1].split()[0], launcher)
+        self.assertEqual(launcher, shutil.which("python3", path=self.env["PATH"]))
+
+    def test_too_old_python_is_refused_before_anything_changes(self):
+        stub = os.path.join(self.tmp, "stubbin", "python3")
+        with open(stub, "w") as f:
+            f.write("#!/bin/sh\nexit 1\n")  # fails the version check
+        os.chmod(stub, 0o755)
+        code, out = self.run_unattended()
+        self.assertNotEqual(code, 0)
+        self.assertIn("needs Python 3.10 or newer", out)
+        self.assertFalse(os.path.exists(self.lib))
+
     # ── attacks by the user being installed for ──────────────────────────────
     def assert_program_still_roots(self):
         for p in (self.lib, os.path.join(self.lib, "syswatch.py"),

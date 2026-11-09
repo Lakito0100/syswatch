@@ -16,6 +16,7 @@ UNIT_DIR="${SYSWATCH_UNIT_DIR:-/etc/systemd/system}"
 DOC_DIR="${SYSWATCH_DOC_DIR:-/usr/share/doc/syswatch}"
 ROOT_HOME="${SYSWATCH_ROOT_HOME:-$(getent passwd root | cut -d: -f6 || true)}"
 ROOT_HOME="${ROOT_HOME:-/root}"
+PYTHON="python3"   # absolute path once ensure_python3 has run
 # Where find_stray_launchers looks besides the target user's ~/.local/bin and
 # ~/bin. Overridable so the tests don't see the real install's launcher.
 if [[ -v SYSWATCH_LAUNCHER_DIRS ]]; then
@@ -40,8 +41,25 @@ check_root() {
     [[ "$EUID" -eq 0 ]] || die "This script must be run as root (use sudo)."
 }
 
-check_python3() {
-    command -v python3 >/dev/null 2>&1 || die "python3 is not available. Please install Python 3."
+# syswatch runs on the system's own python3, whatever version the
+# distribution ships, so no second Python has to be installed alongside it.
+# Only if there's none at all is the distribution's python3 package
+# installed (the newest Python it supports, and the one its python3-psutil
+# package is built for). PYTHON is that interpreter's absolute path; the
+# launcher and the logger service both run on exactly it.
+MIN_PYTHON="3.10"
+
+ensure_python3() {
+    if ! command -v python3 >/dev/null 2>&1; then
+        command -v apt-get >/dev/null 2>&1 \
+            || die "python3 is not installed. Install your distribution's python3 package and re-run."
+        echo "Installing python3 (apt)..."
+        apt-get install -y python3 >/dev/null \
+            || die "Could not install python3 — run 'sudo apt install python3' and re-run."
+    fi
+    PYTHON="$(command -v python3)"
+    "$PYTHON" -c "import sys; sys.exit(sys.version_info < tuple(map(int, '$MIN_PYTHON'.split('.'))))" \
+        || die "syswatch needs Python $MIN_PYTHON or newer, and this system's python3 ($PYTHON) is $("$PYTHON" -c 'import platform; print(platform.python_version())' 2>/dev/null || echo "older")."
 }
 
 # Resolves the user syswatch is installed for — --user NAME if given,
@@ -151,7 +169,7 @@ trap cleanup_stage EXIT
 py() {
     local who="$1"
     shift
-    as_owner "$who" env PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$STAGE_DIR" python3 "$@"
+    as_owner "$who" env PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$STAGE_DIR" "$PYTHON" "$@"
 }
 
 # Summaries of existing config/data files come from syswatch_inventory.py, so
@@ -258,7 +276,7 @@ find_stray_launchers() {
 # Only reported: something else on the system might use it.
 report_pip_leftovers() {
     local origin
-    origin="$(python3 -c 'import importlib.util as u; s = u.find_spec("asciichartpy"); print(s.origin if s else "")' 2>/dev/null || true)"
+    origin="$("$PYTHON" -c 'import importlib.util as u; s = u.find_spec("asciichartpy"); print(s.origin if s else "")' 2>/dev/null || true)"
     if [[ -n "$origin" ]]; then
         echo "  Note: asciichartpy is installed at $(dirname "$origin") (pip-installed by older"
         echo "        syswatch versions). syswatch bundles it now, so it isn't needed any more;"
@@ -267,7 +285,7 @@ report_pip_leftovers() {
 }
 
 ensure_psutil() {
-    if python3 -c 'import psutil' 2>/dev/null; then
+    if "$PYTHON" -c 'import psutil' 2>/dev/null; then
         return
     fi
     if command -v apt-get >/dev/null 2>&1; then
@@ -627,7 +645,7 @@ install_program_files() {
     echo "  Installed $(find "$LIB_DIR" -maxdepth 1 -name '*.py' | wc -l) files to $LIB_DIR"
 
     install -d -m 755 "$(dirname "$BIN_FILE")"
-    printf '#!/bin/bash\nexec python3 %q "$@"\n' "$LIB_DIR/syswatch.py" > "$BIN_FILE"
+    printf '#!/bin/bash\nexec %q %q "$@"\n' "$PYTHON" "$LIB_DIR/syswatch.py" > "$BIN_FILE"
     chmod 755 "$BIN_FILE"
     echo "  Installed $BIN_FILE"
 
@@ -636,8 +654,10 @@ install_program_files() {
         install -d -m 755 "$UNIT_DIR"
         install -m 644 "$service_src" "$SERVICE_DST"
         # The repo unit ships with a placeholder User=; run the logger as the
-        # user installing it, from wherever the files actually went.
+        # user installing it, from wherever the files actually went, on the
+        # same python3 as the launcher.
         sed -i -e "s|^User=.*|User=${INSTALL_USER}|" \
+               -e "s|^ExecStart=/usr/bin/python3 |ExecStart=${PYTHON} |" \
                -e "s|/usr/local/lib/syswatch/|${LIB_DIR}/|" "$SERVICE_DST"
         echo "  Installed $SERVICE_DST (User=${INSTALL_USER})"
         systemctl daemon-reload
@@ -678,7 +698,7 @@ start_logger() {
 
 do_install() {
     check_root
-    check_python3
+    ensure_python3
     resolve_install_target
     check_privilege_tools
     make_stage

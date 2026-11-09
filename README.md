@@ -33,6 +33,7 @@ The same command installs a fresh copy or upgrades an existing one.
 - All `syswatch*.py` modules go to `/usr/local/lib/syswatch/`, with a wrapper at `/usr/local/bin/syswatch`.
 - `syswatch-logger.service` is installed and started, running as you, so metrics collection begins immediately.
 - A fully commented example config goes to `/usr/share/doc/syswatch/config.example.toml`.
+- syswatch runs on the system's own `python3` (3.10 or newer), so nothing else needs installing. If there's no `python3` at all, the distribution's `python3` package is installed with apt; if it's older than 3.10, the installer stops and says so.
 - If `python3-psutil` is missing, it's installed with apt.
 
 **Upgrading an older version.** Any earlier syswatch is detected — its version is shown, or "older than 1.1" for versions that didn't record one — and its program files are removed completely before the new ones go in. That covers `/usr/local/lib/syswatch/`, the wrapper, the logger service and the doc directory, so no stale module or cache from an older layout survives. Two more checks run at the same time:
