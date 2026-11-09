@@ -6,14 +6,18 @@ on:
 
 jobs:
   unit:
-    runs-on: ubuntu-latest
+    # ubuntu-latest is Ubuntu 26.04, for which actions/setup-python has no
+    # Python 3.9 build (3.9 is end-of-life), so that job failed before running
+    # a single test. 3.9 stays in the matrix — Debian 11 and Raspberry Pi OS 11
+    # ship it — on the newest runner that still has a build for it.
+    runs-on: ${{ matrix.python-version == '3.9' && 'ubuntu-24.04' || 'ubuntu-latest' }}
     strategy:
       fail-fast: false
       matrix:
         python-version: ["3.9", "3.10", "3.11", "3.12", "3.13"]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python-version }}
       - name: Install dependencies
@@ -26,7 +30,7 @@ jobs:
   installer:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install dependencies
         run: sudo apt-get update && sudo apt-get install -y python3-psutil shellcheck
       - name: shellcheck
